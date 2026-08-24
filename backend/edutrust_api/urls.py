@@ -16,6 +16,7 @@ urlpatterns = [
     path("teachers/match", views.teachers_match),
     path("teachers/<uuid:teacher_id>", views.teacher_profile),
     path("teachers/<uuid:teacher_id>/trust-profile", views.teacher_trust_profile),
+    path("teachers/<uuid:teacher_id>/reviews", views.teacher_reviews),
     path("bookings/hold", views.bookings_hold),
     path("bookings/<uuid:booking_id>/confirm", views.bookings_confirm),
     path("bookings", views.bookings_list),
@@ -35,4 +36,17 @@ urlpatterns = [
     path("admin/payments", views.admin_payments),
     path("admin/events", views.admin_events),
     path("admin/security-events", views.admin_security_events),
+
+    # Vertical Slice 4: verified review + basic dispute foundation
+    path("sessions/<uuid:session_id>/review", views.sessions_review),
+    path("reviews", views.reviews_list),
+    path("disputes", views.disputes),
+    path("disputes/<uuid:dispute_id>", views.disputes_detail),
+
+    # Vertical Slice 5: payout lifecycle (MANUAL_OPS / MOCK)
+    path("teacher/payouts", views.teacher_payouts_list),
+    path("teacher/payouts/<uuid:payout_id>", views.teacher_payouts_detail),
+    path("admin/payouts/process", views.admin_payouts_process),
+    path("admin/payouts", views.admin_payouts),
+
 ]

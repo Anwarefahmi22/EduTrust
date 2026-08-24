@@ -170,9 +170,84 @@ Real payout: forbidden
 Production: forbidden
 ```
 
-Current automated backend tests:
+Automated backend tests at end of VS2:
 
 ```bash
 ./scripts/run_backend_tests.sh
 # 17 passed
+```
+
+## DEV Vertical Slice #3
+
+Implemented session execution lifecycle using the existing approved schema/state model (no schema changes):
+
+```text
+Booking → Payment Confirmed → Session Scheduled → Session Execution → Attendance/No-show → Completion → Teacher Report → Parent Report → Student Progress Events
+```
+
+Additional Sprint 4 endpoints:
+
+```text
+GET  /api/v1/sessions
+GET  /api/v1/sessions/:id
+POST /api/v1/sessions/:id/start
+POST /api/v1/sessions/:id/complete
+POST /api/v1/sessions/:id/no-show
+GET  /api/v1/sessions/:id/report
+POST /api/v1/sessions/:id/report
+```
+
+Automated backend tests at end of VS3:
+
+```bash
+./scripts/run_backend_tests.sh
+# 26 passed
+```
+
+## DEV Vertical Slice #4
+
+Implemented verified review + basic dispute foundation on the existing approved baseline (no schema, state-machine, or architecture changes):
+
+```text
+Completed Session → Review Eligibility → Verified Review → Review Read → Dispute Open → Dispute Read → Admin/OPS Review → Audit/Security Events
+```
+
+- Reviews are **verified by construction**: eligibility = completed session + completed booking + confirmed payment + parent ownership (DB trigger as final guard). The client cannot set `is_verified` (schema enforces `is_verified = TRUE`).
+- Disputes follow the approved **overlay model**: opening a dispute never sets `DISPUTED` on bookings/sessions; payout blocking is enforced by the existing database trigger.
+- `SAFETY` disputes automatically receive priority 1. Dispute resolution/moderation is **not** part of VS4.
+- Duplicate/concurrent protection: one review per session (DB unique), one active dispute per (actor, interaction); idempotency via the established `Idempotency-Key` pattern (replay/conflict semantics).
+
+VS4 endpoints:
+
+```text
+POST /api/v1/sessions/:id/review          # PARENT only
+GET  /api/v1/sessions/:id/review          # PARENT/TEACHER/ADMIN/OPS (admin/ops audited)
+GET  /api/v1/reviews                      # own scope; ADMIN/OPS operational (audited)
+GET  /api/v1/teachers/:id/reviews         # public: visible verified reviews, no student data
+POST /api/v1/disputes                     # PARENT/TEACHER participants
+GET  /api/v1/disputes                     # own scope; ADMIN/OPS operational (audited)
+GET  /api/v1/disputes/:id                 # participant scope; ADMIN/OPS audited
+```
+
+Strict boundaries (unchanged):
+
+```text
+Real payment: forbidden
+Real payout: forbidden
+Production: forbidden
+```
+
+Current automated backend tests:
+
+```bash
+./scripts/run_backend_tests.sh
+# 83 passed (54 baseline regression + 29 VS5)
+```
+
+Strict boundaries (unchanged):
+
+```text
+Real payment: forbidden
+Real payout: forbidden
+Production: forbidden
 ```

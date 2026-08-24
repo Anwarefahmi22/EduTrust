@@ -241,3 +241,86 @@ def sessions_report(request, session_id: str):
         from .errors import ApiError
         raise ApiError("FORBIDDEN", "Only the assigned teacher can create this report.", 403)
     return Response({"data": create_session_report(request.user.id, request.user.roles, session_id, request.data or {}, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)}, status=201)
+
+# ---- Vertical Slice 4 views: verified review + basic dispute foundation ----
+
+@api_view(["GET", "POST"])
+@require_roles("PARENT", "TEACHER", "ADMIN", "OPS")
+def sessions_review(request, session_id: str):
+    from .services import create_review, get_review_for_session
+    if request.method == "POST":
+        if "PARENT" not in request.user.roles:
+            from .errors import ApiError
+            raise ApiError("FORBIDDEN", "Only the parent of this session can create a review.", 403)
+        data = create_review(request.user.id, session_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+        return Response({"data": data, "request_id": getattr(request, "request_id", None)}, status=201)
+    return Response({"data": get_review_for_session(request.user.id, request.user.roles, session_id, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("PARENT", "TEACHER", "ADMIN", "OPS")
+def reviews_list(request):
+    from .services import list_own_reviews
+    return Response({"data": list_own_reviews(request.user.id, request.user.roles, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@authentication_classes([])
+@permission_classes([])
+def teacher_reviews(request, teacher_id: str):
+    from .services import list_teacher_public_reviews
+    return Response({"data": list_teacher_public_reviews(teacher_id), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET", "POST"])
+@require_roles("PARENT", "TEACHER", "ADMIN", "OPS")
+def disputes(request):
+    from .services import list_disputes_for_user, open_dispute
+    if request.method == "POST":
+        if "PARENT" not in request.user.roles and "TEACHER" not in request.user.roles:
+            from .errors import ApiError
+            raise ApiError("FORBIDDEN", "Only parents and teachers can open disputes.", 403)
+        data = open_dispute(request.user.id, request.user.roles, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+        return Response({"data": data, "request_id": getattr(request, "request_id", None)}, status=201)
+    if not ({"PARENT", "TEACHER", "ADMIN", "OPS"} & set(request.user.roles)):
+        from .errors import ApiError
+        raise ApiError("FORBIDDEN", "You do not have permission to view disputes.", 403)
+    return Response({"data": list_disputes_for_user(request.user.id, request.user.roles, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("PARENT", "TEACHER", "ADMIN", "OPS")
+def disputes_detail(request, dispute_id: str):
+    from .services import get_dispute_for_user
+    return Response({"data": get_dispute_for_user(request.user.id, request.user.roles, dispute_id, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+# ---- Vertical Slice 5 views: payout lifecycle (MANUAL_OPS / MOCK) ----
+
+@api_view(["GET"])
+@require_roles("TEACHER")
+def teacher_payouts_list(request):
+    from .services import list_payouts_for_teacher
+    return Response({"data": list_payouts_for_teacher(request.user.id), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("TEACHER")
+def teacher_payouts_detail(request, payout_id: str):
+    from .services import get_payout_for_teacher
+    return Response({"data": get_payout_for_teacher(request.user.id, payout_id), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_payouts_process(request):
+    from .services import create_and_process_payout
+    data = create_and_process_payout(request.user.id, request.user.roles, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)}, status=201)
+
+
+@api_view(["GET"])
+@require_roles("OPS", "ADMIN")
+def admin_payouts(request):
+    from .services import list_admin_payouts
+    return Response({"data": list_admin_payouts(request.user.id, request.user.roles, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+

@@ -971,3 +971,691 @@ def get_session_report_for_user(user_id: str, roles: list[str], session_id: str,
         write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "session_report", "entity_id": report["id"], "request_id": request_id})
     report["progress_events"] = fetchall("SELECT id::text, event_type::text, topic, note, session_id::text, report_id::text, created_at FROM edutrust.student_progress_events WHERE report_id=%s ORDER BY created_at, id", [report["id"]])
     return report
+
+
+# ---- Vertical Slice 4 verified review + basic dispute foundation services ----
+#
+# Baselines implemented here (no new business rules):
+# - State Machines v1.0 section 10 (Review State Machine): eligibility =
+#   session COMPLETED + booking COMPLETED + payment CONFIRMED + one review per
+#   session + reviewer is the parent of the student + not the teacher.
+#   Duplicate -> 409 DUPLICATE_REVIEW. Eligibility failure -> 422
+#   REVIEW_NOT_ELIGIBLE.
+# - State Machines v1.1 Addendum section 4 (Dispute Overlay Model): a dispute
+#   is a procedural overlay. Opening a dispute MUST NOT set bookings.status or
+#   sessions.status to DISPUTED. Payout blocking is already enforced at the
+#   database level by validate_payout_item_eligibility().
+# - API Architecture v1.0 section 19 (Dispute APIs): POST /disputes,
+#   GET /disputes, GET /disputes/:id, SAFETY -> priority 1, actor must
+#   participate in the referenced booking/session/payment.
+# - Schema v1: reviews.session_id UNIQUE, is_verified CHECK (is_verified = TRUE)
+#   (verification is derived server-side; clients cannot set it), and the
+#   trg_reviews_validate_eligibility DB trigger as final consistency guard.
+
+DISPUTE_CATEGORIES = {
+    "TEACHER_NO_SHOW", "STUDENT_NO_SHOW", "SESSION_QUALITY",
+    "PAYMENT_REFUND", "SAFETY", "REPORT_ISSUE", "OTHER",
+}
+
+
+def create_review(parent_user_id: str, session_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    from django.db import IntegrityError
+    comment = data.get("comment")
+    if comment is not None:
+        comment = str(comment).strip() or None
+    try:
+        rating_value = int(data.get("rating"))
+    except (TypeError, ValueError):
+        raise ApiError("VALIDATION_ERROR", "rating must be an integer between 1 and 5.", 400)
+    if rating_value < 1 or rating_value > 5:
+        raise ApiError("VALIDATION_ERROR", "rating must be an integer between 1 and 5.", 400)
+    # Verification is derived from the qualifying completed session. Any
+    # client-provided "verified" flag is intentionally ignored.
+    canonical = {"session_id": str(session_id), "rating": rating_value, "comment": comment}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    with tx():
+        replay = None
+        if idempotency_key:
+            replay = _idempotency_begin("review_create", parent_user_id, idempotency_key, request_hash, f"/api/v1/sessions/{session_id}/review")
+        if replay:
+            return replay["response_body"]
+        parent = fetchone("SELECT id::text FROM edutrust.parent_profiles WHERE user_id=%s", [parent_user_id])
+        if not parent:
+            raise ApiError("FORBIDDEN", "Parent profile is required.", 403)
+        # Lock the session row so concurrent creation attempts serialize here.
+        row = fetchone(
+            """
+            SELECT s.id::text, s.booking_id::text, s.status::text,
+                   s.parent_id::text, s.student_id::text, s.teacher_id::text,
+                   pp.user_id::text AS parent_user_id,
+                   b.status::text AS booking_status
+            FROM edutrust.sessions s
+            JOIN edutrust.parent_profiles pp ON pp.id=s.parent_id
+            JOIN edutrust.bookings b ON b.id=s.booking_id
+            WHERE s.id=%s FOR UPDATE
+            """,
+            [session_id],
+        )
+        if not row:
+            raise ApiError("RESOURCE_NOT_FOUND", "Session not found.", 404)
+        if row["parent_user_id"] != parent_user_id:
+            raise ApiError("FORBIDDEN", "Only the parent of this session can create a review.", 403)
+        existing = fetchone("SELECT id::text FROM edutrust.reviews WHERE session_id=%s", [session_id])
+        if existing:
+            raise ApiError("DUPLICATE_REVIEW", "A review already exists for this session.", 409)
+        if row["status"] != "COMPLETED" or row["booking_status"] != "COMPLETED":
+            raise ApiError(
+                "REVIEW_NOT_ELIGIBLE",
+                "A review can only be created for a completed session with a completed booking.",
+                422,
+                {"session_status": row["status"], "booking_status": row["booking_status"]},
+            )
+        payment = fetchone(
+            "SELECT 1 AS one FROM edutrust.payments WHERE booking_id=%s AND status='CONFIRMED' LIMIT 1",
+            [row["booking_id"]],
+        )
+        if not payment:
+            raise ApiError(
+                "REVIEW_NOT_ELIGIBLE",
+                "A review can only be created for a completed session with a completed booking and a confirmed payment.",
+                422,
+                {"session_status": row["status"], "booking_status": row["booking_status"]},
+            )
+        try:
+            review = fetchone(
+                """
+                INSERT INTO edutrust.reviews (session_id, booking_id, parent_id, student_id, teacher_id, rating, comment)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id::text, session_id::text, booking_id::text, parent_id::text, student_id::text, teacher_id::text,
+                          rating, comment, status::text, is_verified, created_at
+                """,
+                [session_id, row["booking_id"], row["parent_id"], row["student_id"], row["teacher_id"], rating_value, comment],
+            )
+        except IntegrityError:
+            # reviews.session_id UNIQUE is the final consistency guard.
+            raise ApiError("DUPLICATE_REVIEW", "A review already exists for this session.", 409)
+        write_event(
+            "REVIEW_CREATED", "review", review["id"],
+            actor_user_id=parent_user_id, actor_role="PARENT", request_id=request_id,
+            metadata={"session_id": session_id, "booking_id": row["booking_id"], "is_verified": True},
+        )
+        response = {"review": _serialize_row(review)}
+        if idempotency_key:
+            _idempotency_complete("review_create", parent_user_id, idempotency_key, 201, response, "review", review["id"])
+        return response
+
+
+def get_review_for_session(user_id: str, roles: list[str], session_id: str, request_id: str | None = None) -> dict:
+    row = _session_access_row(session_id)
+    if not _can_access_session(user_id, roles, row):
+        raise ApiError("FORBIDDEN", "You do not have access to this review.", 403)
+    review = fetchone(
+        """
+        SELECT r.id::text, r.session_id::text, r.booking_id::text, r.parent_id::text, r.student_id::text, r.teacher_id::text,
+               r.rating, r.comment, r.status::text, r.is_verified, r.created_at,
+               tp.public_name AS teacher_public_name, sp.display_name AS student_display_name
+        FROM edutrust.reviews r
+        JOIN edutrust.teacher_profiles tp ON tp.id=r.teacher_id
+        JOIN edutrust.student_profiles sp ON sp.id=r.student_id
+        WHERE r.session_id=%s
+        """,
+        [session_id],
+    )
+    if not review:
+        raise ApiError("REVIEW_NOT_FOUND", "No review exists for this session yet.", 404)
+    if "ADMIN" in roles or "OPS" in roles:
+        write_event("ADMIN_ACTION", "review", review["id"], actor_user_id=user_id, actor_role="ADMIN" if "ADMIN" in roles else "OPS", request_id=request_id, metadata={"action": "READ_REVIEW"})
+        write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "review", "entity_id": review["id"], "request_id": request_id})
+    return _serialize_row(review)
+
+
+def list_own_reviews(user_id: str, roles: list[str], request_id: str | None = None) -> list[dict]:
+    if "ADMIN" in roles or "OPS" in roles:
+        write_event("ADMIN_ACTION", "reviews", None, actor_user_id=user_id, actor_role="ADMIN" if "ADMIN" in roles else "OPS", request_id=request_id, metadata={"action": "READ_REVIEW_LIST"})
+        write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "reviews", "request_id": request_id})
+        return fetchall(
+            """
+            SELECT r.id::text, r.session_id::text, r.booking_id::text, r.rating, r.comment, r.status::text, r.is_verified, r.created_at,
+                   tp.public_name AS teacher_public_name, sp.display_name AS student_display_name
+            FROM edutrust.reviews r
+            JOIN edutrust.teacher_profiles tp ON tp.id=r.teacher_id
+            JOIN edutrust.student_profiles sp ON sp.id=r.student_id
+            ORDER BY r.created_at DESC LIMIT 100
+            """,
+        )
+    if "TEACHER" in roles:
+        teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE user_id=%s", [user_id])
+        if not teacher:
+            return []
+        return fetchall(
+            """
+            SELECT r.id::text, r.session_id::text, r.booking_id::text, r.rating, r.comment, r.status::text, r.is_verified, r.created_at,
+                   sp.display_name AS student_display_name
+            FROM edutrust.reviews r
+            JOIN edutrust.student_profiles sp ON sp.id=r.student_id
+            WHERE r.teacher_id=%s
+            ORDER BY r.created_at DESC LIMIT 100
+            """,
+            [teacher["id"]],
+        )
+    parent = fetchone("SELECT id::text FROM edutrust.parent_profiles WHERE user_id=%s", [user_id])
+    if not parent:
+        return []
+    return fetchall(
+        """
+        SELECT r.id::text, r.session_id::text, r.booking_id::text, r.rating, r.comment, r.status::text, r.is_verified, r.created_at,
+               tp.public_name AS teacher_public_name
+        FROM edutrust.reviews r
+        JOIN edutrust.teacher_profiles tp ON tp.id=r.teacher_id
+        WHERE r.parent_id=%s
+        ORDER BY r.created_at DESC LIMIT 100
+        """,
+        [parent["id"]],
+    )
+
+
+def list_teacher_public_reviews(teacher_id: str) -> list[dict]:
+    teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE id=%s", [teacher_id])
+    if not teacher:
+        raise ApiError("RESOURCE_NOT_FOUND", "Teacher not found.", 404)
+    # Public read: only visible verified reviews, no student-identifying data.
+    return fetchall(
+        """
+        SELECT id::text, rating, comment, is_verified, created_at
+        FROM edutrust.reviews
+        WHERE teacher_id=%s AND status='VISIBLE' AND is_verified
+        ORDER BY created_at DESC
+        LIMIT 100
+        """,
+        [teacher_id],
+    )
+
+
+def _dispute_participation(user_id: str, booking_id: str | None, session_id: str | None, payment_id: str | None) -> dict:
+    """Verify actor participation in every provided target (API Architecture section 19.3)."""
+    refs = {"booking_id": None, "session_id": None, "payment_id": None}
+    if session_id:
+        srow = fetchone(
+            """
+            SELECT s.id::text, s.booking_id::text, pp.user_id::text AS parent_user_id, tp.user_id::text AS teacher_user_id
+            FROM edutrust.sessions s
+            JOIN edutrust.parent_profiles pp ON pp.id=s.parent_id
+            JOIN edutrust.teacher_profiles tp ON tp.id=s.teacher_id
+            WHERE s.id=%s
+            """,
+            [session_id],
+        )
+        if not srow:
+            raise ApiError("RESOURCE_NOT_FOUND", "Referenced session not found.", 404)
+        if srow["parent_user_id"] != user_id and srow["teacher_user_id"] != user_id:
+            raise ApiError("FORBIDDEN", "You are not a participant in the referenced session.", 403)
+        refs["session_id"] = session_id
+        refs["booking_id"] = srow["booking_id"]
+    if booking_id:
+        brow = fetchone(
+            """
+            SELECT b.id::text, pp.user_id::text AS parent_user_id, tp.user_id::text AS teacher_user_id
+            FROM edutrust.bookings b
+            JOIN edutrust.parent_profiles pp ON pp.id=b.parent_id
+            JOIN edutrust.teacher_profiles tp ON tp.id=b.teacher_id
+            WHERE b.id=%s
+            """,
+            [booking_id],
+        )
+        if not brow:
+            raise ApiError("RESOURCE_NOT_FOUND", "Referenced booking not found.", 404)
+        if brow["parent_user_id"] != user_id and brow["teacher_user_id"] != user_id:
+            raise ApiError("FORBIDDEN", "You are not a participant in the referenced booking.", 403)
+        refs["booking_id"] = booking_id
+    if payment_id:
+        prow = fetchone(
+            """
+            SELECT p.id::text, p.booking_id::text, pp.user_id::text AS parent_user_id
+            FROM edutrust.payments p
+            JOIN edutrust.parent_profiles pp ON pp.id=p.parent_id
+            WHERE p.id=%s
+            """,
+            [payment_id],
+        )
+        if not prow:
+            raise ApiError("RESOURCE_NOT_FOUND", "Referenced payment not found.", 404)
+        if prow["parent_user_id"] != user_id:
+            raise ApiError("FORBIDDEN", "You are not a participant in the referenced payment.", 403)
+        refs["booking_id"] = refs["booking_id"] or prow["booking_id"]
+    if not any(refs.values()):
+        raise ApiError("VALIDATION_ERROR", "At least one of booking_id, session_id, or payment_id is required.", 400)
+    return refs
+
+
+def open_dispute(user_id: str, roles: list[str], data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    if "PARENT" not in roles and "TEACHER" not in roles:
+        raise ApiError("FORBIDDEN", "Only parents and teachers can open disputes.", 403)
+    category = str(data.get("category") or "").upper()
+    if category not in DISPUTE_CATEGORIES:
+        raise ApiError("VALIDATION_ERROR", f"category must be one of {sorted(DISPUTE_CATEGORIES)}.", 400)
+    description = (data.get("description") or "").strip() or None
+    priority = data.get("priority")
+    if category == "SAFETY":
+        priority_value = 1  # Safety disputes always receive highest priority (State Machines section 11.2)
+    else:
+        if priority is None:
+            priority_value = 3
+        else:
+            try:
+                priority_value = int(priority)
+            except (TypeError, ValueError):
+                raise ApiError("VALIDATION_ERROR", "priority must be an integer between 1 and 5.", 400)
+            if priority_value < 1 or priority_value > 5:
+                raise ApiError("VALIDATION_ERROR", "priority must be an integer between 1 and 5.", 400)
+    booking_id = str(data.get("booking_id")) if data.get("booking_id") is not None else None
+    session_id = str(data.get("session_id")) if data.get("session_id") is not None else None
+    payment_id = str(data.get("payment_id")) if data.get("payment_id") is not None else None
+    canonical = {"booking_id": booking_id, "session_id": session_id, "payment_id": payment_id, "category": category, "priority": priority_value, "description": description}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    with tx():
+        replay = None
+        if idempotency_key:
+            replay = _idempotency_begin("dispute_open", user_id, idempotency_key, request_hash, "/api/v1/disputes")
+        if replay:
+            return replay["response_body"]
+        refs = _dispute_participation(user_id, booking_id, session_id, payment_id)
+        # Lock the derived booking row so concurrent openings for the same
+        # interaction serialize here (State Machines section 11.3: lock target rows).
+        fetchone("SELECT id::text FROM edutrust.bookings WHERE id=%s FOR UPDATE", [refs["booking_id"]])
+        # Service-level duplicate invariant: at most one active dispute per
+        # (actor, interaction). Every dispute row created through this service
+        # carries the interaction's booking_id, so the interaction is keyed on it.
+        duplicate = fetchone(
+            "SELECT id::text, status::text FROM edutrust.disputes WHERE opened_by_user_id=%s AND status IN ('OPEN','UNDER_REVIEW') AND booking_id=%s LIMIT 1",
+            [user_id, refs["booking_id"]],
+        )
+        if duplicate:
+            raise ApiError("DUPLICATE_DISPUTE", "An open dispute already exists for this interaction.", 409, {"dispute_id": duplicate["id"]})
+        dispute = fetchone(
+            """
+            INSERT INTO edutrust.disputes (booking_id, session_id, payment_id, opened_by_user_id, category, status, priority, description)
+            VALUES (%s, %s, %s, %s, %s::edutrust.dispute_category, 'OPEN', %s, %s)
+            RETURNING id::text, booking_id::text, session_id::text, payment_id::text, opened_by_user_id::text,
+                      category::text, status::text, priority, description, assigned_admin_user_id::text,
+                      resolution, resolved_at, created_at, updated_at
+            """,
+            [refs["booking_id"], session_id, payment_id, user_id, category, priority_value, description],
+        )
+        write_event(
+            "DISPUTE_OPENED", "dispute", dispute["id"],
+            actor_user_id=user_id, actor_role="PARENT" if "PARENT" in roles else "TEACHER", request_id=request_id,
+            metadata={"category": category, "priority": priority_value, "booking_id": refs["booking_id"], "session_id": session_id, "payment_id": payment_id, "overlay_only": True},
+        )
+        response = {"dispute": _serialize_row(dispute)}
+        if idempotency_key:
+            _idempotency_complete("dispute_open", user_id, idempotency_key, 201, response, "dispute", dispute["id"])
+        return response
+
+
+def _dispute_access_row(dispute_id: str) -> dict:
+    row = fetchone(
+        """
+        SELECT d.id::text, d.booking_id::text, d.session_id::text, d.payment_id::text, d.opened_by_user_id::text,
+               d.category::text, d.status::text, d.priority, d.description, d.assigned_admin_user_id::text,
+               d.resolution, d.resolved_at, d.created_at, d.updated_at,
+               pp.user_id::text AS parent_user_id, tp.user_id::text AS teacher_user_id
+        FROM edutrust.disputes d
+        JOIN edutrust.bookings b ON b.id=d.booking_id
+        JOIN edutrust.parent_profiles pp ON pp.id=b.parent_id
+        JOIN edutrust.teacher_profiles tp ON tp.id=b.teacher_id
+        WHERE d.id=%s
+        """,
+        [dispute_id],
+    )
+    if not row:
+        raise ApiError("RESOURCE_NOT_FOUND", "Dispute not found.", 404)
+    return row
+
+
+def _can_access_dispute(user_id: str, roles: list[str], row: dict) -> bool:
+    if "ADMIN" in roles or "OPS" in roles:
+        return True
+    if row["opened_by_user_id"] == user_id:
+        return True
+    # Opposing participants of the referenced interaction may read the dispute.
+    return row["parent_user_id"] == user_id or row["teacher_user_id"] == user_id
+
+
+def get_dispute_for_user(user_id: str, roles: list[str], dispute_id: str, request_id: str | None = None) -> dict:
+    row = _dispute_access_row(dispute_id)
+    if not _can_access_dispute(user_id, roles, row):
+        raise ApiError("FORBIDDEN", "You do not have access to this dispute.", 403)
+    if "ADMIN" in roles or "OPS" in roles:
+        write_event("ADMIN_ACTION", "dispute", dispute_id, actor_user_id=user_id, actor_role="ADMIN" if "ADMIN" in roles else "OPS", request_id=request_id, metadata={"action": "READ_DISPUTE"})
+        write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "dispute", "entity_id": dispute_id, "request_id": request_id})
+    teacher = fetchone("SELECT public_name FROM edutrust.teacher_profiles WHERE id=(SELECT teacher_id FROM edutrust.bookings WHERE id=%s)", [row["booking_id"]])
+    student = fetchone("SELECT display_name FROM edutrust.student_profiles WHERE id=(SELECT student_id FROM edutrust.bookings WHERE id=%s)", [row["booking_id"]])
+    row["teacher_public_name"] = teacher["public_name"] if teacher else None
+    row["student_display_name"] = student["display_name"] if student else None
+    return _serialize_row(row)
+
+
+def list_disputes_for_user(user_id: str, roles: list[str], request_id: str | None = None) -> list[dict]:
+    base = """
+        SELECT d.id::text, d.booking_id::text, d.session_id::text, d.payment_id::text, d.opened_by_user_id::text,
+               d.category::text, d.status::text, d.priority, d.description, d.created_at,
+               tp.public_name AS teacher_public_name, sp.display_name AS student_display_name
+        FROM edutrust.disputes d
+        JOIN edutrust.bookings b ON b.id=d.booking_id
+        JOIN edutrust.teacher_profiles tp ON tp.id=b.teacher_id
+        JOIN edutrust.student_profiles sp ON sp.id=b.student_id
+    """
+    if "ADMIN" in roles or "OPS" in roles:
+        write_event("ADMIN_ACTION", "disputes", None, actor_user_id=user_id, actor_role="ADMIN" if "ADMIN" in roles else "OPS", request_id=request_id, metadata={"action": "READ_DISPUTE_LIST"})
+        write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "disputes", "request_id": request_id})
+        return fetchall(base + " ORDER BY d.created_at DESC LIMIT 100")
+    conds: list[str] = []
+    sql_params: list = []
+    if "TEACHER" in roles:
+        teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE user_id=%s", [user_id])
+        if teacher:
+            conds.append("tp.id=%s")
+            sql_params.append(teacher["id"])
+    if "PARENT" in roles:
+        parent = fetchone("SELECT id::text FROM edutrust.parent_profiles WHERE user_id=%s", [user_id])
+        if parent:
+            conds.append("pp.id=%s")
+            sql_params.append(parent["id"])
+    conds.append("d.opened_by_user_id=%s")
+    sql_params.append(user_id)
+    return fetchall(
+        base + " JOIN edutrust.parent_profiles pp ON pp.id=b.parent_id WHERE (" + " OR ".join(conds) + ") ORDER BY d.created_at DESC LIMIT 100",
+        sql_params,
+    )
+
+# ---- Vertical Slice 5 payout lifecycle services (MANUAL_OPS / MOCK execution) ----
+#
+# Baselines implemented here (no new business rules, no schema/state changes):
+# - State Machines v1.0 section 12 (Payout State Machine): PENDING -> ELIGIBLE ->
+#   PROCESSING -> PAID/FAILED, allowed/forbidden transitions, ledger behavior,
+#   failure/compensation. PAID rows are DB-immutable via v1.4
+#   trg_00_payouts_paid_immutable_v1_4 (recovery = separate adjustment/recovery
+#   ledger transaction, never mutation).
+# - State Machines v1.1 Addendum section 10 (authoritative net-payable
+#   calculation: gross - approved/provider-pending/succeeded partial-refund
+#   teacher adjustments - other approved deductions; net = 0 -> no item) and
+#   section 11 (post-paid correction is adjustment/reversal only).
+# - API Architecture section 15 (Payout APIs): GET /teacher/payouts,
+#   GET /teacher/payouts/:id, POST /admin/payouts/process (OPS/ADMIN,
+#   Idempotency-Key payout-<uuid>, two-transaction boundary), GET /admin/payouts.
+# - U1 (approved): DEV execution is MANUAL_OPS/MOCK only - no real payout
+#   provider, no money movement, no provider-specific behavior.
+# - U2 (approved): PENDING batches are created through the authorized Admin/Ops
+#   workflow; no scheduled jobs or automation.
+
+PAYOUT_MOCK_PROVIDER_REFERENCE_PREFIX = "mock_payout_"
+
+
+def _payout_session_row_for_update(session_id: str) -> dict:
+    row = fetchone(
+        """
+        SELECT s.id::text AS session_id, s.booking_id::text, s.status::text, s.teacher_id::text,
+               b.status::text AS booking_status, b.platform_commission_bps
+        FROM edutrust.sessions s
+        JOIN edutrust.bookings b ON b.id=s.booking_id
+        WHERE s.id=%s FOR UPDATE
+        """,
+        [session_id],
+    )
+    if not row:
+        raise ApiError("RESOURCE_NOT_FOUND", "Session not found.", 404, {"session_id": session_id})
+    return row
+
+
+def _payout_ineligibility_reasons(row: dict) -> tuple[list[dict], Decimal | None]:
+    """Service-level eligibility per SM v1.0 section 12.2 + Addendum section 10.5.
+    The DB trigger validate_payout_item_eligibility remains the final guard."""
+    reasons: list[dict] = []
+    sid = row["session_id"]
+    if row["status"] != "COMPLETED":
+        reasons.append({"session_id": sid, "reason": "SESSION_NOT_COMPLETED"})
+    report = fetchone("SELECT 1 AS one FROM edutrust.session_reports WHERE session_id=%s", [sid])
+    if not report:
+        reasons.append({"session_id": sid, "reason": "NO_SESSION_REPORT"})
+    payment = fetchone(
+        "SELECT amount FROM edutrust.payments WHERE booking_id=%s AND status='CONFIRMED' ORDER BY created_at DESC LIMIT 1",
+        [row["booking_id"]],
+    )
+    if not payment:
+        reasons.append({"session_id": sid, "reason": "NO_CONFIRMED_PAYMENT"})
+    dispute = fetchone(
+        "SELECT 1 AS one FROM edutrust.disputes WHERE status IN ('OPEN','UNDER_REVIEW') AND (session_id=%s OR booking_id=%s) LIMIT 1",
+        [sid, row["booking_id"]],
+    )
+    if dispute:
+        reasons.append({"session_id": sid, "reason": "OPEN_DISPUTE"})
+    # Strict reading of "no full refund exists" (Addendum 10.5): any FULL refund
+    # row for the booking blocks the session (documented plan decision).
+    full_refund = fetchone(
+        "SELECT 1 AS one FROM edutrust.refunds WHERE booking_id=%s AND refund_type='FULL' LIMIT 1",
+        [row["booking_id"]],
+    )
+    if full_refund:
+        reasons.append({"session_id": sid, "reason": "FULL_REFUND_EXISTS"})
+    return reasons, payment
+
+
+def _calculate_session_net(row: dict, payment_amount: Decimal) -> Decimal:
+    """Addendum section 10.1: gross - refund exposure - other approved deductions."""
+    amount = Decimal(str(payment_amount))
+    commission = (amount * Decimal(str(row["platform_commission_bps"])) / Decimal("10000")).quantize(Decimal("0.01"))
+    gross = amount - commission
+    exposure = fetchone(
+        """
+        SELECT COALESCE(SUM(teacher_adjustment_amount), 0) AS s
+        FROM edutrust.refunds
+        WHERE booking_id=%s AND refund_type='PARTIAL' AND status IN ('APPROVED','PROVIDER_PENDING','SUCCEEDED')
+        """,
+        [row["booking_id"]],
+    )
+    net = gross - Decimal(str(exposure["s"]))
+    return net.quantize(Decimal("0.01"))
+
+
+def create_and_process_payout(user_id: str, roles: list[str], data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    if "OPS" not in roles and "ADMIN" not in roles:
+        raise ApiError("FORBIDDEN", "Only OPS/ADMIN can process payouts.", 403)
+    teacher_id = str(data.get("teacher_id")) if data.get("teacher_id") is not None else None
+    session_ids = data.get("session_ids") or []
+    force_mock_failure = bool(data.get("force_mock_failure"))
+    if not teacher_id or not isinstance(session_ids, list) or not session_ids:
+        raise ApiError("VALIDATION_ERROR", "teacher_id and a non-empty session_ids list are required.", 400)
+    if len(session_ids) != len(set(session_ids)):
+        raise ApiError("VALIDATION_ERROR", "session_ids must be unique.", 400)
+    session_ids = sorted(str(s) for s in session_ids)  # deterministic lock order
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    canonical = {"teacher_id": teacher_id, "session_ids": session_ids, "force_mock_failure": force_mock_failure}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+
+    # TX1 — creation + eligibility (API Architecture 15.3 first transaction boundary).
+    with tx():
+        replay = _idempotency_begin("payout_process", user_id, idempotency_key, request_hash, "/api/v1/admin/payouts/process")
+        if replay:
+            return replay["response_body"]
+        teacher = fetchone("SELECT id::text, public_name FROM edutrust.teacher_profiles WHERE id=%s FOR UPDATE", [teacher_id])
+        if not teacher:
+            raise ApiError("RESOURCE_NOT_FOUND", "Teacher not found.", 404)
+        nets: list[tuple[str, Decimal]] = []
+        ineligible: list[dict] = []
+        for sid in session_ids:
+            row = _payout_session_row_for_update(sid)
+            if row["teacher_id"] != teacher_id:
+                raise ApiError("PAYOUT_SESSION_NOT_OWNED", "Session does not belong to this teacher.", 422, {"session_id": sid})
+            reasons, payment = _payout_ineligibility_reasons(row)
+            if reasons:
+                ineligible.extend(reasons)
+                continue
+            net = _calculate_session_net(row, payment["amount"])
+            if net <= 0:
+                ineligible.append({"session_id": sid, "reason": "NET_PAYABLE_ZERO"})
+                continue
+            existing_item = fetchone("SELECT 1 AS one FROM edutrust.payout_items WHERE session_id=%s", [sid])
+            if existing_item:
+                raise ApiError("PAYOUT_SESSION_ALREADY_PAYOUT", "Session already included in a payout item.", 409, {"session_id": sid})
+            nets.append((sid, net))
+        if ineligible:
+            raise ApiError("PAYOUT_INELIGIBLE", "One or more sessions are not payout-eligible.", 422, {"details": ineligible})
+        total = sum(net for _, net in nets)
+        payout = fetchone(
+            """
+            INSERT INTO edutrust.payouts (teacher_id, amount, currency, status)
+            VALUES (%s, %s, 'DZD', 'PENDING')
+            RETURNING id::text, teacher_id::text, amount::text, currency, status::text, eligible_at, paid_at, provider_reference, created_at
+            """,
+            [teacher_id, total],
+        )
+        for sid, net in nets:
+            execute(
+                "INSERT INTO edutrust.payout_items (payout_id, teacher_id, session_id, amount, currency) VALUES (%s, %s, %s, %s, 'DZD')",
+                [payout["id"], teacher_id, sid, net],
+            )
+        # PENDING -> ELIGIBLE (SM 12.3: authority PayoutService/OPS admin process).
+        execute("UPDATE edutrust.payouts SET status='ELIGIBLE', eligible_at=now(), updated_at=now() WHERE id=%s", [payout["id"]])
+        ledger_tx = fetchone(
+            """
+            INSERT INTO edutrust.ledger_transactions (transaction_type, status, payout_id, reference)
+            VALUES ('TEACHER_PAYOUT', 'DRAFT', %s, %s)
+            RETURNING id::text
+            """,
+            [payout["id"], f"payout:{payout['id']}"],
+        )
+        execute(
+            """
+            INSERT INTO edutrust.ledger_entries (ledger_transaction_id, account_type, direction, amount, memo)
+            VALUES (%s, 'TEACHER_PAYABLE', 'DEBIT', %s, %s),
+                   (%s, 'TEACHER_CASH', 'CREDIT', %s, %s)
+            """,
+            [ledger_tx["id"], total, f"payout {payout['id']}", ledger_tx["id"], total, f"payout {payout['id']}"],
+        )
+        write_event(
+            "PAYOUT_ELIGIBLE", "payout", payout["id"],
+            actor_user_id=user_id, actor_role=actor_role, request_id=request_id,
+            metadata={"session_ids": session_ids, "item_count": len(nets), "total": str(total), "dev_mock": True},
+        )
+        # ELIGIBLE -> PROCESSING (SM 12.3: OPS/Admin).
+        execute("UPDATE edutrust.payouts SET status='PROCESSING', updated_at=now() WHERE id=%s", [payout["id"]])
+
+    # MOCK EXECUTION — outside the DB transaction, per API Architecture 15.3.
+    # U1: MANUAL_OPS/MOCK only. Deterministic DEV result; no provider call,
+    # no credentials, no money movement, no provider-specific behavior.
+    result = "FAILED" if force_mock_failure else "PAID"
+
+    # TX2 — outcome (API Architecture 15.3 second transaction boundary).
+    with tx():
+        fetchone("SELECT id::text FROM edutrust.payouts WHERE id=%s FOR UPDATE", [payout["id"]])
+        if result == "PAID":
+            provider_reference = f"{PAYOUT_MOCK_PROVIDER_REFERENCE_PREFIX}{payout['id']}"
+            execute(
+                "UPDATE edutrust.payouts SET status='PAID', paid_at=now(), provider_reference=%s, updated_at=now() WHERE id=%s",
+                [provider_reference, payout["id"]],
+            )
+            # Final TEACHER_PAYOUT ledger is posted only on success (SM 12.5.3).
+            execute("UPDATE edutrust.ledger_transactions SET status='POSTED' WHERE id=%s", [ledger_tx["id"]])
+            write_event(
+                "PAYOUT_PROCESSED", "payout", payout["id"],
+                actor_user_id=user_id, actor_role=actor_role, request_id=request_id,
+                metadata={"provider_reference": provider_reference, "dev_mock": True},
+            )
+        else:
+            execute("UPDATE edutrust.payouts SET status='FAILED', updated_at=now() WHERE id=%s", [payout["id"]])
+            # DRAFT ledger was never posted -> no funds moved -> VOID, no reversal needed (SM 12.6).
+            execute("UPDATE edutrust.ledger_transactions SET status='VOIDED' WHERE id=%s", [ledger_tx["id"]])
+            write_event(
+                "ADMIN_ACTION", "payout", payout["id"],
+                actor_user_id=user_id, actor_role=actor_role, request_id=request_id,
+                metadata={"action": "PAYOUT_PROCESS_FAILED", "dev_mock": True, "reason": "mock_failure_forced"},
+            )
+        response = {
+            "payout": _serialize_row(payout),
+            "items": _serialize_row_rows(
+                fetchall(
+                    "SELECT session_id::text, amount::text, currency FROM edutrust.payout_items WHERE payout_id=%s ORDER BY created_at, id",
+                    [payout["id"]],
+                )
+            ),
+            "ledger": {"transaction_id": ledger_tx["id"], "status": "POSTED" if result == "PAID" else "VOIDED"},
+            "result": result,
+        }
+        # Refresh payout row for the response (final status/dates).
+        response["payout"] = _serialize_row(
+            fetchone(
+                "SELECT id::text, teacher_id::text, amount::text, currency, status::text, eligible_at, paid_at, provider_reference, created_at FROM edutrust.payouts WHERE id=%s",
+                [payout["id"]],
+            )
+        )
+        _idempotency_complete("payout_process", user_id, idempotency_key, 201, response, "payout", payout["id"])
+    return response
+
+
+def _serialize_row_rows(rows: list[dict]) -> list[dict]:
+    return [_serialize_row(r) for r in rows]
+
+
+def _teacher_profile_id(user_id: str) -> str:
+    teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE user_id=%s", [user_id])
+    if not teacher:
+        raise ApiError("FORBIDDEN", "Teacher profile is required.", 403)
+    return teacher["id"]
+
+
+def get_payout_for_teacher(user_id: str, payout_id: str) -> dict:
+    teacher_id = _teacher_profile_id(user_id)
+    row = fetchone(
+        """
+        SELECT p.id::text, p.teacher_id::text, p.amount::text, p.currency, p.status::text,
+               p.eligible_at, p.paid_at, p.created_at,
+               (SELECT count(*)::int FROM edutrust.payout_items pi WHERE pi.payout_id=p.id) AS item_count
+        FROM edutrust.payouts p
+        WHERE p.id=%s AND p.teacher_id=%s
+        """,
+        [payout_id, teacher_id],
+    )
+    if not row:
+        raise ApiError("RESOURCE_NOT_FOUND", "Payout not found.", 404)
+    row["items"] = fetchall(
+        "SELECT id::text, session_id::text, amount::text, currency, created_at FROM edutrust.payout_items WHERE payout_id=%s ORDER BY created_at, id",
+        [payout_id],
+    )
+    # provider_reference intentionally omitted from teacher views (internal mock identity).
+    return _serialize_row(row)
+
+
+def list_payouts_for_teacher(user_id: str) -> list[dict]:
+    teacher_id = _teacher_profile_id(user_id)
+    return fetchall(
+        """
+        SELECT p.id::text, p.teacher_id::text, p.amount::text, p.currency, p.status::text,
+               p.eligible_at, p.paid_at, p.created_at,
+               (SELECT count(*)::int FROM edutrust.payout_items pi WHERE pi.payout_id=p.id) AS item_count
+        FROM edutrust.payouts p
+        WHERE p.teacher_id=%s
+        ORDER BY p.created_at DESC LIMIT 100
+        """,
+        [teacher_id],
+    )
+
+
+def list_admin_payouts(user_id: str, roles: list[str], request_id: str | None = None) -> list[dict]:
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    write_event("ADMIN_ACTION", "payouts", None, actor_user_id=user_id, actor_role=actor_role, request_id=request_id, metadata={"action": "READ_PAYOUT_LIST"})
+    write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "payouts", "request_id": request_id})
+    return fetchall(
+        """
+        SELECT p.id::text, p.teacher_id::text, p.amount::text, p.currency, p.status::text,
+               p.eligible_at, p.paid_at, p.provider_reference, p.created_at,
+               tp.public_name AS teacher_public_name,
+               (SELECT count(*)::int FROM edutrust.payout_items pi WHERE pi.payout_id=p.id) AS item_count
+        FROM edutrust.payouts p
+        JOIN edutrust.teacher_profiles tp ON tp.id=p.teacher_id
+        ORDER BY p.created_at DESC LIMIT 100
+        """,
+    )
+
