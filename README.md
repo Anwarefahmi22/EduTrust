@@ -346,3 +346,61 @@ Real payment: forbidden
 Real payout: forbidden
 Production: forbidden
 ```
+## DEV Vertical Slice #8
+
+Implemented refund operations on the existing approved baseline (no schema, state-machine, or architecture changes):
+
+```text
+Eligibility (payment CONFIRMED/DISPUTED, over-refund bound under lock)
+→ REQUESTED → APPROVED (actor-supplied allocation: teacher + platform = approved)
+→ PROVIDER_PENDING (DEV mock provider call outside the DB transaction)
+→ SUCCEEDED / FAILED (deterministic mock result)
+   or via the approved reconciliation command (Addendum v1.1 §7.3)
+Payment shadow: CONFIRMED/DISPUTED → REFUND_PENDING → REFUNDED / PARTIALLY_REFUNDED
+               (restored on failure/cancel; REFUND_ISSUED is never emitted)
+```
+
+- Approval is the only allocation entry point: the approving OPS/ADMIN supplies `teacher_adjustment_amount` + `platform_adjustment_amount` (sum = `approved_amount`, DB-enforced); no automatic formula, no defaults — OPS-POL-007 value remains OPEN and unmodified.
+- Ledger per approved schema: DRAFT `REFUND` tx at approval → POSTED on success / VOIDED on failure; form L (late → `REFUND_PAYABLE` settlement), D (direct reversal of `TEACHER_PAYABLE`/`PLATFORM_REVENUE`), A (post-paid recovery via `TEACHER_RECOVERABLE`/`PLATFORM_REFUND_EXPENSE` — old PAID payout byte-identical, v1.4).
+- Late refunds (VS2 branch, unchanged) progress through the same commands — no auto-approval (OPS-POL-003 unset behavior); reconciliation is the documented DEV proof path and also handles the manual/bank-confirmation case.
+- Provider events reuse `payment_provider_events` (no new table, no new event enum values); replay → 200 duplicate, identity conflict → 409 + `SUSPICIOUS_ACTIVITY` security event (Addendum §8 / SM §7.8).
+- Payout interaction: a refund in flight (`REFUND_PENDING`) blocks new payout items for the session via the existing v1 DB guard; the Addendum §10.4 net-reduction vector remains pinned by the VS5 suite. No payout code modified.
+- Reads: admin refund list/detail (audited detail, redacted provider summary) + additive `refunds[]` / `refund_summary` / `linked_refunds[]` on payment/booking/dispute reads (Addendum §8; fields appear only when activity exists).
+
+VS8 endpoints:
+
+```text
+POST /api/v1/payments/:id/refund                        # OPS/ADMIN, Idempotency-Key required
+POST /api/v1/admin/refunds/:id/approve                  # OPS/ADMIN, Idempotency-Key required (allocation input)
+POST /api/v1/admin/refunds/:id/reject                   # OPS/ADMIN, Idempotency-Key required
+POST /api/v1/admin/refunds/:id/cancel                   # OPS/ADMIN, Idempotency-Key required
+POST /api/v1/admin/refunds/:id/mock/succeed             # OPS/ADMIN, DEV-only (deterministic mock SUCCESS)
+POST /api/v1/admin/refunds/:id/mock/fail                # OPS/ADMIN, DEV-only (deterministic mock FAILURE)
+POST /api/v1/admin/refunds/:id/reconcile                # OPS/ADMIN (ADMIN_OVERRIDE ⇒ ADMIN), Idempotency-Key required
+GET  /api/v1/admin/refunds                              # OPS/ADMIN (filters + cursor pagination)
+GET  /api/v1/admin/refunds/:id                          # OPS/ADMIN (audited, redacted)
+```
+
+Current automated backend tests:
+
+```bash
+./scripts/run_backend_tests.sh
+# 160 passed (118 baseline regression + 42 VS8: 38 service + 4 concurrency)
+```
+
+VS8 E2E (standalone, isolated runtime):
+
+```bash
+PG_BIN=<pg bin dir> python tests/e2e_refund_lifecycle.py
+# 53/53 checks PASS (7 scenarios + 8 financial-integrity gates)
+```
+
+Strict boundaries (unchanged):
+
+```text
+Real refund: forbidden
+Real payment: forbidden
+Real payout: forbidden
+Production: forbidden
+```
+

@@ -380,3 +380,76 @@ def admin_teacher_reject(request, teacher_id: str):
     from .services import review_verification
     data = review_verification(request.user.id, request.user.roles, teacher_id, (request.data or {}).get("verification_id"), "REJECTED", (request.data or {}).get("rejection_reason"), request_id=getattr(request, "request_id", None))
     return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+# ---- Vertical Slice 8 views: refund operations (DEV mock only) ----
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def payments_refund(request, payment_id: str):
+    from .services import create_refund
+    data = create_refund(request.user.id, request.user.roles, payment_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)}, status=201)
+
+
+@api_view(["GET"])
+@require_roles("OPS", "ADMIN")
+def admin_refunds(request):
+    from .services import list_admin_refunds
+    result = list_admin_refunds(request.user.id, request.user.roles, request.query_params, request_id=getattr(request, "request_id", None))
+    return Response({"data": result["data"], "pagination": result["pagination"], "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_detail(request, refund_id: str):
+    from .services import get_admin_refund
+    data = get_admin_refund(request.user.id, request.user.roles, refund_id, request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_approve(request, refund_id: str):
+    from .services import approve_refund
+    data = approve_refund(request.user.id, request.user.roles, refund_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_reject(request, refund_id: str):
+    from .services import reject_refund
+    data = reject_refund(request.user.id, request.user.roles, refund_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_cancel(request, refund_id: str):
+    from .services import cancel_refund
+    data = cancel_refund(request.user.id, request.user.roles, refund_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_mock_succeed(request, refund_id: str):
+    from .services import process_mock_refund_result
+    data = process_mock_refund_result(request.user.id, request.user.roles, refund_id, "succeeded", provider_event_id=(request.data or {}).get("provider_event_id"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_mock_fail(request, refund_id: str):
+    from .services import process_mock_refund_result
+    data = process_mock_refund_result(request.user.id, request.user.roles, refund_id, "failed", provider_event_id=(request.data or {}).get("provider_event_id"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_refund_reconcile(request, refund_id: str):
+    from .services import reconcile_refund
+    data = reconcile_refund(request.user.id, request.user.roles, refund_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})

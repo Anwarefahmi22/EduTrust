@@ -22,6 +22,15 @@ export default function AdminDashboardShell() {
   const [verifDetail, setVerifDetail] = useState<any | null>(null)
   const [verifNote, setVerifNote] = useState('')
   const [verifResult, setVerifResult] = useState('')
+  const [refunds, setRefunds] = useState<any[]>([])
+  const [refundDetail, setRefundDetail] = useState<any | null>(null)
+  const [rApprove, setRApprove] = useState('')
+  const [rTeacherAdj, setRTeacherAdj] = useState('')
+  const [rPlatformAdj, setRPlatformAdj] = useState('')
+  const [rReason, setRReason] = useState('')
+  const [rReconcileResult, setRReconcileResult] = useState('SUCCEEDED')
+  const [rReconcileRef, setRReconcileRef] = useState('')
+  const [refundResult, setRefundResult] = useState('')
   const addLog = (m: string) => setLog((l) => [m, ...l].slice(0, 12))
   async function loginOnly() { const res:any=await apiPost('/api/v1/auth/login',{identifier:email,password}); setToken(res.data.access_token); addLog('Admin logged in') }
   async function securityEvents() { const res:any=await apiGet('/api/v1/admin/security-events',token); addLog(`Security events ${res.data.count}`) }
@@ -93,6 +102,49 @@ export default function AdminDashboardShell() {
     } catch (e: any) { setVerifResult(`Review failed: ${e.message}`); addLog(`Review failed: ${e.message}`) }
   }
 
+  async function loadRefunds() {
+    const res: any = await apiGet('/api/v1/admin/refunds', token)
+    setRefunds(res.data || [])
+    addLog(`Refunds (operational): ${res.data.length}`)
+  }
+  async function loadRefundDetail(refundId: string) {
+    const res: any = await apiGet(`/api/v1/admin/refunds/${refundId}`, token)
+    setRefundDetail(res.data)
+    addLog(`Refund detail loaded ${refundId} — access audited`)
+  }
+  async function refundAction(action: string) {
+    if (!refundDetail) return
+    const id = refundDetail.refund_id
+    const body: any = {}
+    try {
+      if (action === 'approve') {
+        const approved = rApprove || refundDetail.requested_amount
+        if (!rTeacherAdj || !rPlatformAdj) { setRefundResult('Enter teacher + platform allocation (must sum to approved amount)'); return }
+        body.approved_amount = approved
+        body.teacher_adjustment_amount = rTeacherAdj
+        body.platform_adjustment_amount = rPlatformAdj
+        if (rReason.trim()) body.reason_code = rReason.trim()
+      } else if (action === 'reject' || action === 'cancel') {
+        if (!rReason.trim()) { setRefundResult('Enter a reason before rejecting/cancelling'); return }
+        body.reason = rReason.trim()
+      } else if (action === 'reconcile') {
+        if (!rReconcileRef.trim()) { setRefundResult('Enter a reconciliation reference'); return }
+        body.result = rReconcileResult
+        body.reconciliation_source = 'MANUAL_RECONCILIATION'
+        body.reconciliation_reference = rReconcileRef.trim()
+        body.reconciled_at = new Date().toISOString()
+        body.reason = rReason.trim() || 'Manual reconciliation recorded.'
+      } else if (action === 'mock_succeed' || action === 'mock_fail') {
+        body.provider_event_id = `rfevt-${crypto.randomUUID()}`
+      }
+      const res: any = await apiPost(`/api/v1/admin/refunds/${id}/${action === 'mock_succeed' ? 'mock/succeed' : action === 'mock_fail' ? 'mock/fail' : action}`, body, token, `ref-${crypto.randomUUID()}`)
+      setRefundResult(`${action} → refund ${res.data.refund?.status || res.data.refund_status}, payment ${res.data.payment_status || res.data.refund?.payment_status}`)
+      addLog(`Refund ${action}: ${id} → ${res.data.refund?.status || res.data.refund_status}`)
+      loadRefundDetail(id)
+      loadRefunds()
+    } catch (e: any) { setRefundResult(`${action} rejected: ${e.message}`); addLog(`Refund ${action} rejected: ${e.message}`) }
+  }
+
   return <>
     <section className="card"><span className="badge warning">Admin / OPS shell</span><h1>Admin Dashboard</h1><p className="muted">Admin users are seeded/created outside public registration. Sensitive access is logged.</p></section>
     <section className="grid"><div className="card"><h2>Login</h2><input value={email} onChange={e=>setEmail(e.target.value)} style={{width:'100%',padding:8}}/><br/><br/><button className="primary" onClick={loginOnly}>Login existing admin</button></div><div className="card"><h2>Audit</h2><button className="primary" onClick={securityEvents} disabled={!token}>Read security events</button> <button onClick={payments} disabled={!token}>Payments</button> <button onClick={events} disabled={!token}>Event ledger</button> <button onClick={sessions} disabled={!token}>Sessions</button><p className="muted">This access will be logged.</p></div></section>
@@ -151,6 +203,51 @@ export default function AdminDashboardShell() {
         {verifResult && <p className="muted">{verifResult}</p>}
       </div>}
       <p className="muted">Documents are metadata-only in DEV (no real storage). All actions are logged (ADMIN_ACTION + security events).</p>
+    </section>
+    <section className="card"><span className="badge warning">VS8 — Refund Operations (DEV mock)</span><h2>Refunds (operational)</h2>
+      <button className="primary" onClick={loadRefunds} disabled={!token}>Load refunds</button>
+      <ul>{refunds.map(r => (
+        <li key={r.refund_id}>{r.status} · {r.refund_type} · {r.requested_amount}{r.approved_amount ? ` → ${r.approved_amount}` : ''} {r.currency} — <a href="#" onClick={(e) => { e.preventDefault(); loadRefundDetail(r.refund_id) }}>detail</a></li>
+      ))}</ul>
+      {refundDetail && <div>
+        <h3>Refund {refundDetail.status} (payment {refundDetail.payment_status})</h3>
+        <p className="muted">requested {refundDetail.requested_amount} {refundDetail.currency} · type {refundDetail.refund_type} · reason: {refundDetail.reason}{refundDetail.reason_code ? ` (${refundDetail.reason_code})` : ''}</p>
+        {refundDetail.approved_amount && <p>
+          Allocation: approved <b>{refundDetail.approved_amount}</b> = teacher <b>{refundDetail.teacher_adjustment_amount}</b> + platform <b>{refundDetail.platform_adjustment_amount}</b>
+          {' '}(total equals approved amount)
+        </p>}
+        {refundDetail.timeline && <p className="muted">timeline: created {String(refundDetail.timeline.created_at).slice(0,16)}{refundDetail.timeline.approved_at ? ` · approved ${String(refundDetail.timeline.approved_at).slice(11,16)}` : ''}{refundDetail.timeline.provider_submitted_at ? ` · submitted ${String(refundDetail.timeline.provider_submitted_at).slice(11,16)}` : ''}{refundDetail.timeline.completed_at ? ` · completed ${String(refundDetail.timeline.completed_at).slice(11,16)}` : ''}{refundDetail.timeline.failed_at ? ` · failed ${String(refundDetail.timeline.failed_at).slice(11,16)}` : ''}</p>}
+        {refundDetail.reconciliation && <p>Reconciliation: {refundDetail.reconciliation.source} / {refundDetail.reconciliation.reference} @ {String(refundDetail.reconciliation.reconciled_at).slice(0,16)}</p>}
+        <p className="muted">provider events: {(refundDetail.provider_event_summary || []).map((e: any) => `${e.event_type}(${e.status})`).join(', ') || 'none'}</p>
+        {refundDetail.status === 'REQUESTED' && <div>
+          <input placeholder="approved_amount (default requested)" value={rApprove} onChange={e=>setRApprove(e.target.value)} style={{width:180,padding:8}}/>
+          <input placeholder="teacher adjustment" value={rTeacherAdj} onChange={e=>setRTeacherAdj(e.target.value)} style={{width:140,padding:8}}/>
+          <input placeholder="platform adjustment" value={rPlatformAdj} onChange={e=>setRPlatformAdj(e.target.value)} style={{width:140,padding:8}}/>
+          <input placeholder="reason_code (optional)" value={rReason} onChange={e=>setRReason(e.target.value)} style={{width:180,padding:8}}/>
+          <br/><br/>
+          <button onClick={()=>refundAction('approve')}>Approve (allocation required)</button>
+          <button onClick={()=>refundAction('reject')}>Reject</button>
+          <button onClick={()=>refundAction('cancel')}>Cancel</button>
+        </div>}
+        {refundDetail.status === 'PROVIDER_PENDING' && <div>
+          <label><input type="checkbox" defaultChecked={false}/> DEV mock provider result: </label>
+          <button onClick={()=>refundAction('mock_succeed')}>Mock success</button>
+          <button onClick={()=>refundAction('mock_fail')}>Mock failure</button>
+          <span className="muted"> or reconcile manually: </span>
+          <select value={rReconcileResult} onChange={e=>setRReconcileResult(e.target.value)} style={{padding:4}}>
+            <option value="SUCCEEDED">SUCCEEDED</option>
+            <option value="FAILED">FAILED</option>
+          </select>
+          <input placeholder="reconciliation reference (e.g. BANK-REF-123)" value={rReconcileRef} onChange={e=>setRReconcileRef(e.target.value)} style={{width:240,padding:8}}/>
+          <input placeholder="reason" value={rReason} onChange={e=>setRReason(e.target.value)} style={{width:180,padding:8}}/>
+          <button onClick={()=>refundAction('reconcile')}>Reconcile</button>
+          <br/><br/>
+          <button onClick={()=>refundAction('cancel')}>Cancel (pre-success)</button>
+        </div>}
+        {(refundDetail.status === 'SUCCEEDED' || refundDetail.status === 'FAILED' || refundDetail.status === 'REJECTED' || refundDetail.status === 'CANCELLED') && <p className="muted">Terminal state — no further transitions.</p>}
+        {refundResult && <p className="muted">{refundResult}</p>}
+      </div>}
+      <p className="muted">DEV mock only: no real refund provider, no real money. Allocation is actor-supplied (no automatic formula). All actions are audited (ADMIN_ACTION + security events); REFUND_ISSUED is never emitted.</p>
     </section>
     <section className="card"><h2>Activity</h2>{log.map((l,i)=><p key={i}>{l}</p>)}</section>
   </>

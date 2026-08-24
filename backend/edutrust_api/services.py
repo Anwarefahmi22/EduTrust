@@ -511,6 +511,20 @@ def get_booking_for_user(user_id: str, roles: list[str], booking_id: str) -> dic
         raise ApiError("RESOURCE_NOT_FOUND", "Booking not found.", 404)
     if row["parent_user_id"] != user_id and row["teacher_user_id"] != user_id and "ADMIN" not in roles:
         raise ApiError("FORBIDDEN", "You do not have access to this booking.", 403)
+    # VS8 (Addendum v1.1 section 8.2): refund_summary when applicable.
+    refund_rows = fetchall(
+        "SELECT status::text, approved_amount, currency FROM edutrust.refunds WHERE booking_id=%s ORDER BY created_at",
+        [booking_id],
+    )
+    if refund_rows:
+        total = sum((r["approved_amount"] for r in refund_rows if r["approved_amount"] is not None), Decimal("0"))
+        active = next((r["status"] for r in reversed(refund_rows) if r["status"] in REFUND_ACTIVE_STATUSES), None)
+        row["refund_summary"] = {
+            "has_refund_activity": True,
+            "active_refund_status": active,
+            "total_approved_refund_amount": str(total.quantize(Decimal("0.01"))),
+            "currency": "DZD",
+        }
     return row
 
 
@@ -621,6 +635,17 @@ def get_payment_for_user(user_id: str, roles: list[str], payment_id: str) -> dic
         """,
         [payment_id],
     ) if "ADMIN" in roles else []
+    # VS8 (Addendum v1.1 section 8.1): refunds[] summary when refund activity exists.
+    refunds = fetchall(
+        """
+        SELECT id::text AS refund_id, status::text, refund_type::text, requested_amount::text, approved_amount::text,
+               currency, reason, created_at, approved_at, provider_submitted_at, completed_at
+        FROM edutrust.refunds WHERE payment_id=%s ORDER BY created_at
+        """,
+        [payment_id],
+    )
+    if refunds:
+        payment["refunds"] = _serialize_row_rows(refunds)
     return payment
 
 
@@ -1345,6 +1370,13 @@ def get_dispute_for_user(user_id: str, roles: list[str], dispute_id: str, reques
     student = fetchone("SELECT display_name FROM edutrust.student_profiles WHERE id=(SELECT student_id FROM edutrust.bookings WHERE id=%s)", [row["booking_id"]])
     row["teacher_public_name"] = teacher["public_name"] if teacher else None
     row["student_display_name"] = student["display_name"] if student else None
+    # VS8 (Addendum v1.1 section 8.3): linked_refunds when applicable.
+    linked = fetchall(
+        "SELECT id::text AS refund_id, status::text, approved_amount::text, currency FROM edutrust.refunds WHERE dispute_id=%s ORDER BY created_at",
+        [dispute_id],
+    )
+    if linked:
+        row["linked_refunds"] = _serialize_row_rows(linked)
     return _serialize_row(row)
 
 
@@ -2069,3 +2101,697 @@ def review_verification(user_id: str, roles: list[str], teacher_id: str, verific
     result = _verification_with_documents(verification_id)
     status = fetchone("SELECT verification_status::text FROM edutrust.teacher_profiles WHERE id=%s", [teacher_id])["verification_status"]
     return {"verification": result, "profile_verification_status": status}
+
+# ---- Vertical Slice 8 refund operations services (DEV mock only) ----
+#
+# Baselines implemented here (no new business rules, no schema/state changes):
+# - API Architecture section 12.6 (POST /payments/:id/refund, OPS under
+#   policy / ADMIN elevated, two-transaction boundary, provider call
+#   outside the DB transaction) and section 24 (idempotency required).
+# - API Contract Addendum v1.1 sections 7.1/7.2 (admin refund reads) and
+#   7.3 (POST /admin/refunds/:id/reconcile, verbatim contract) and section 8
+#   (refund summaries in payment/booking/dispute reads).
+# - State Machines v1.0 section 14 (refund lifecycle: 7 states, transition
+#   matrix, partial/full behavior) and v1.1 Addendum sections 7 (states,
+#   event semantics, forbidden semantics), 8.4 (provider_refund_id linked to
+#   refunds.id), 13.1/13.2/13.3 (event list, REFUND_ISSUED deprecation,
+#   event timing), 15.4 (over-refund prevention).
+# - Schema v1.1 (refunds table, allocation + integrity trigger,
+#   api_idempotency_keys, payment_provider_events with refund linkage),
+#   v1.2 (lifecycle guard, reconciliation proof), v1.3 (hardening).
+# - D1 (approved): DEV mock initiation via the existing
+#   MockPaymentProvider.initiate_refund() primitive. D2 (approved):
+#   deterministic mock SUCCESS/FAILURE only. D3 (approved): reuse
+#   payment_provider_events; no new table; no new event enum values;
+#   REFUND_ISSUED is never emitted. D9 (approved): allocation explicitly
+#   supplied by the authorized Admin/OPS actor at approval; no formula.
+# - REAL REFUND / REAL PAYMENT / REAL PAYOUT remain FORBIDDEN; DEV mock only.
+
+REFUND_TERMINAL_STATUSES = ("SUCCEEDED", "FAILED", "REJECTED", "CANCELLED")
+REFUND_ACTIVE_STATUSES = ("REQUESTED", "APPROVED", "PROVIDER_PENDING")
+
+
+def _refund_amount(value, field: str) -> "Decimal":
+    try:
+        amount = Decimal(str(value).strip())
+    except Exception:
+        raise ApiError("VALIDATION_ERROR", f"{field} must be a decimal string amount.", 400)
+    if not amount.is_finite() or amount <= 0:
+        raise ApiError("VALIDATION_ERROR", f"{field} must be a positive decimal amount.", 400)
+    return amount.quantize(Decimal("0.01"))
+
+
+def _refund_nonnegative_amount(value, field: str) -> "Decimal":
+    try:
+        amount = Decimal(str(value).strip())
+    except Exception:
+        raise ApiError("VALIDATION_ERROR", f"{field} must be a decimal string amount.", 400)
+    if not amount.is_finite() or amount < 0:
+        raise ApiError("VALIDATION_ERROR", f"{field} must be a non-negative decimal amount.", 400)
+    return amount.quantize(Decimal("0.01"))
+
+
+def _refund_require_key(idempotency_key: str | None) -> None:
+    if idempotency_key is not None and len(str(idempotency_key)) < 16:
+        raise ApiError("VALIDATION_ERROR", "Idempotency-Key must be at least 16 characters.", 400)
+
+
+def _refund_payment_for_update(payment_id: str) -> dict:
+    payment = fetchone(
+        """
+        SELECT id::text, booking_id::text, amount::text, currency, status::text, provider::text
+        FROM edutrust.payments WHERE id=%s FOR UPDATE
+        """,
+        [payment_id],
+    )
+    if not payment:
+        raise ApiError("RESOURCE_NOT_FOUND", "Payment not found.", 404)
+    return payment
+
+
+def _refund_row_for_update(refund_id: str) -> dict:
+    refund = fetchone(
+        """
+        SELECT r.id::text, r.payment_id::text, r.booking_id::text, r.dispute_id::text,
+               r.provider::text, r.refund_type::text, r.status::text, r.requested_amount::text,
+               r.approved_amount::text, r.currency, r.teacher_adjustment_amount::text,
+               r.platform_adjustment_amount::text, r.reason, r.reason_code, r.provider_refund_id,
+               r.metadata, r.reconciliation_source, r.reconciliation_reference, r.reconciled_at,
+               r.reconciled_by_user_id::text, r.created_at
+        FROM edutrust.refunds r WHERE r.id=%s FOR UPDATE
+        """,
+        [refund_id],
+    )
+    if not refund:
+        raise ApiError("RESOURCE_NOT_FOUND", "Refund not found.", 404)
+    return refund
+
+
+def _refund_reserved_amount(payment_id: str, exclude_refund_id: str | None = None) -> "Decimal":
+    params: list = [payment_id]
+    sql = "SELECT COALESCE(SUM(approved_amount),0) AS s FROM edutrust.refunds WHERE payment_id=%s AND status IN ('APPROVED','PROVIDER_PENDING','SUCCEEDED')"
+    if exclude_refund_id:
+        sql += " AND id<>%s"
+        params.append(exclude_refund_id)
+    return Decimal(str(fetchone(sql, params)["s"]))
+
+
+def _refund_ledger_form(booking_id: str) -> str:
+    """PLAN-LOCK (D10): L = late/unfulfillable (zero sessions), D = direct
+    reversal (fulfilled, no PAID payout), A = post-paid recovery (PAID payout
+    covering the booking exists). Determined at approval, recorded on the tx."""
+    paid = fetchone(
+        """
+        SELECT 1 AS one FROM edutrust.payouts p
+        JOIN edutrust.payout_items pi ON pi.payout_id=p.id
+        JOIN edutrust.sessions s ON s.id=pi.session_id
+        WHERE p.status='PAID' AND s.booking_id=%s LIMIT 1
+        """,
+        [booking_id],
+    )
+    if paid:
+        return "A"
+    session = fetchone("SELECT 1 AS one FROM edutrust.sessions WHERE booking_id=%s LIMIT 1", [booking_id])
+    if not session:
+        return "L"
+    return "D"
+
+
+def _create_refund_ledger_draft(refund_id: str, payment_id: str, booking_id: str, form: str,
+                                approved: "Decimal", teacher_adj: "Decimal", platform_adj: "Decimal") -> str:
+    tx_row = fetchone(
+        "INSERT INTO edutrust.ledger_transactions (transaction_type, status, booking_id, payment_id, reference) "
+        "VALUES ('REFUND','DRAFT',%s,%s,%s) RETURNING id::text",
+        [booking_id, payment_id, f"refund-{refund_id}"],
+    )
+    entries: list[tuple[str, str, "Decimal"]] = []
+    if form == "L":
+        entries.append(("REFUND_PAYABLE", "DEBIT", approved))
+    else:
+        if teacher_adj > 0:
+            entries.append(("TEACHER_PAYABLE" if form == "D" else "TEACHER_RECOVERABLE", "DEBIT", teacher_adj))
+        if platform_adj > 0:
+            entries.append(("PLATFORM_REVENUE" if form == "D" else "PLATFORM_REFUND_EXPENSE", "DEBIT", platform_adj))
+    entries.append(("PAYMENT_PROVIDER_CLEARING", "CREDIT", approved))
+    for account, direction, amount in entries:
+        execute(
+            "INSERT INTO edutrust.ledger_entries (ledger_transaction_id, account_type, direction, amount, memo) "
+            "VALUES (%s,%s::edutrust.ledger_account_type,%s::edutrust.ledger_direction,%s,%s)",
+            [tx_row["id"], account, direction, str(amount), f"refund {refund_id} form {form}"],
+        )
+    return tx_row["id"]
+
+
+def _set_refund_ledger_status(refund_id: str, status: str) -> None:
+    execute("UPDATE edutrust.ledger_transactions SET status=%s WHERE reference=%s",
+            [status, f"refund-{refund_id}"])
+
+
+def _refund_cumulative_succeeded(payment_id: str) -> "Decimal":
+    return Decimal(str(fetchone(
+        "SELECT COALESCE(SUM(approved_amount),0) AS s FROM edutrust.refunds WHERE payment_id=%s AND status='SUCCEEDED'",
+        [payment_id],
+    )["s"]))
+
+
+def _refund_payment_status_after_success(payment_id: str) -> str:
+    payment_amount = Decimal(str(fetchone("SELECT amount::text FROM edutrust.payments WHERE id=%s", [payment_id])["amount"]))
+    return "REFUNDED" if _refund_cumulative_succeeded(payment_id) >= payment_amount else "PARTIALLY_REFUNDED"
+
+
+def _refund_prior_payment_status(refund: dict) -> str:
+    import json
+    meta = refund.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            meta = {}
+    prior = (meta or {}).get("payment_status_before_refund")
+    return prior if prior in ("CONFIRMED", "DISPUTED") else "CONFIRMED"
+
+
+def _refund_detail(refund_id: str) -> dict:
+    row = fetchone(
+        """
+        SELECT r.id::text AS refund_id, r.status::text, r.refund_type::text, r.payment_id::text,
+               r.booking_id::text, r.dispute_id::text, r.provider::text, r.requested_amount::text,
+               r.approved_amount::text, r.currency, r.teacher_adjustment_amount::text,
+               r.platform_adjustment_amount::text, r.reason, r.reason_code, r.provider_refund_id,
+               r.requested_by_user_id::text, r.requested_by_role::text, r.approved_by_user_id::text,
+               r.approved_by_role::text, r.reconciliation_source, r.reconciliation_reference,
+               r.reconciled_at, r.reconciled_by_user_id::text, r.failure_code, r.failure_message,
+               r.created_at, r.approved_at, r.provider_submitted_at, r.completed_at, r.failed_at,
+               r.rejected_at, r.cancelled_at, p.status::text AS payment_status, p.amount::text AS payment_amount
+        FROM edutrust.refunds r JOIN edutrust.payments p ON p.id=r.payment_id
+        WHERE r.id=%s
+        """,
+        [refund_id],
+    )
+    if not row:
+        raise ApiError("RESOURCE_NOT_FOUND", "Refund not found.", 404)
+    row["timeline"] = {
+        "created_at": row.pop("created_at"),
+        "approved_at": row.pop("approved_at"),
+        "provider_submitted_at": row.pop("provider_submitted_at"),
+        "completed_at": row.pop("completed_at"),
+        "failed_at": row.pop("failed_at"),
+        "rejected_at": row.pop("rejected_at"),
+        "cancelled_at": row.pop("cancelled_at"),
+    }
+    row["reconciliation"] = (
+        {
+            "source": row["reconciliation_source"],
+            "reference": row["reconciliation_reference"],
+            "reconciled_at": row["reconciled_at"],
+            "reconciled_by_user_id": row["reconciled_by_user_id"],
+        }
+        if row["reconciliation_source"] is not None
+        else None
+    )
+    return _serialize_row(row)
+
+
+def _refund_list_item(row: dict) -> dict:
+    return {
+        "refund_id": row["id"],
+        "payment_id": row["payment_id"],
+        "booking_id": row["booking_id"],
+        "dispute_id": row["dispute_id"],
+        "provider": row["provider"],
+        "refund_type": row["refund_type"],
+        "status": row["status"],
+        "requested_amount": row["requested_amount"],
+        "approved_amount": row["approved_amount"],
+        "currency": row["currency"],
+        "reason_code": row["reason_code"],
+        "created_at": row["created_at"],
+    }
+
+
+def create_refund(user_id: str, roles: list[str], payment_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    amount = _refund_amount(data.get("amount"), "amount")
+    currency = str(data.get("currency") or "DZD")
+    reason = str(data.get("reason") or "").strip()
+    dispute_id = data.get("dispute_id") or None
+    if currency != "DZD":
+        raise ApiError("VALIDATION_ERROR", "currency must be DZD.", 400)
+    if len(reason) < 3:
+        raise ApiError("VALIDATION_ERROR", "reason must be at least 3 characters.", 400)
+    _refund_require_key(idempotency_key)
+    canonical = {"payment_id": str(payment_id), "amount": str(amount), "currency": currency, "reason": reason, "dispute_id": dispute_id}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    with tx():
+        replay = _idempotency_begin("refund_create", user_id, idempotency_key, request_hash, f"/api/v1/payments/{payment_id}/refund")
+        if replay:
+            return replay["response_body"]
+        payment = _refund_payment_for_update(payment_id)
+        fetchone("SELECT id::text FROM edutrust.bookings WHERE id=%s FOR UPDATE", [payment["booking_id"]])
+        if payment["status"] not in ("CONFIRMED", "DISPUTED"):
+            raise ApiError("REFUND_INVALID_STATE", f"Payment status {payment['status']} is not refundable.", 409, {"payment_status": payment["status"]})
+        if dispute_id is not None:
+            dispute = fetchone("SELECT booking_id::text FROM edutrust.disputes WHERE id=%s", [dispute_id])
+            if not dispute or dispute["booking_id"] != payment["booking_id"]:
+                raise ApiError("VALIDATION_ERROR", "dispute_id must belong to this payment's booking.", 400)
+        if _refund_reserved_amount(payment_id) + amount > Decimal(payment["amount"]):
+            raise ApiError("OVER_REFUND", "Refund request would exceed the payment amount.", 409, {"payment_amount": payment["amount"]})
+        refund_type = "FULL" if amount == Decimal(payment["amount"]) else "PARTIAL"
+        refund = fetchone(
+            """
+            INSERT INTO edutrust.refunds (payment_id, booking_id, dispute_id, provider, refund_type, status,
+                                          requested_amount, currency, reason, idempotency_key,
+                                          requested_by_user_id, requested_by_role)
+            VALUES (%s,%s,%s,%s::edutrust.payment_provider,%s::edutrust.refund_type,'REQUESTED',%s,%s,%s,%s,%s,%s)
+            RETURNING id::text
+            """,
+            [payment_id, payment["booking_id"], dispute_id, payment["provider"], refund_type,
+             str(amount), currency, reason, idempotency_key, user_id, actor_role],
+        )
+        write_event("REFUND_REQUESTED", "refund", refund["id"], actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"requested_amount": str(amount), "dev_mock": payment["provider"] == "OTHER"})
+        write_event("ADMIN_ACTION", "refund", refund["id"], actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"action": "REFUND_CREATED", "payment_id": payment_id})
+        response = {"refund": _refund_detail(refund["id"]), "payment_status": payment["status"]}
+        _idempotency_complete("refund_create", user_id, idempotency_key, 201, response, "refund", refund["id"])
+    return response
+
+
+def approve_refund(user_id: str, roles: list[str], refund_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    from .payments import MockPaymentProvider
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    approved = _refund_amount(data.get("approved_amount"), "approved_amount")
+    teacher_adj = _refund_nonnegative_amount(data.get("teacher_adjustment_amount"), "teacher_adjustment_amount")
+    platform_adj = _refund_nonnegative_amount(data.get("platform_adjustment_amount"), "platform_adjustment_amount")
+    reason_code = str(data.get("reason_code") or "").strip() or None
+    # D9: allocation is actor-supplied; the only validation is the approved
+    # accounting constraint (sum must equal approved_amount). No formula.
+    if teacher_adj + platform_adj != approved:
+        raise ApiError("VALIDATION_ERROR",
+                       "teacher_adjustment_amount + platform_adjustment_amount must equal approved_amount.",
+                       400, {"teacher": str(teacher_adj), "platform": str(platform_adj), "approved": str(approved)})
+    _refund_require_key(idempotency_key)
+    canonical = {"refund_id": str(refund_id), "approved_amount": str(approved),
+                 "teacher_adjustment_amount": str(teacher_adj), "platform_adjustment_amount": str(platform_adj),
+                 "reason_code": reason_code}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    # TX1: approve + DRAFT ledger (balanced), payment -> REFUND_PENDING.
+    with tx():
+        replay = _idempotency_begin("refund_approve", user_id, idempotency_key, request_hash, f"/api/v1/admin/refunds/{refund_id}/approve")
+        if replay:
+            return replay["response_body"]
+        refund_payment_row = fetchone("SELECT payment_id::text FROM edutrust.refunds WHERE id=%s", [refund_id])
+        if not refund_payment_row:
+            raise ApiError("RESOURCE_NOT_FOUND", "Refund not found.", 404)
+        payment_id = refund_payment_row["payment_id"]
+        payment = _refund_payment_for_update(payment_id)
+        refund = _refund_row_for_update(refund_id)
+        if refund["status"] != "REQUESTED":
+            raise ApiError("REFUND_INVALID_STATE", f"Refund must be REQUESTED to approve (current: {refund['status']}).", 409, {"refund_status": refund["status"]})
+        if approved > Decimal(refund["requested_amount"]):
+            raise ApiError("VALIDATION_ERROR", "approved_amount cannot exceed requested_amount.", 400)
+        if refund["refund_type"] == "FULL" and approved != Decimal(payment["amount"]):
+            raise ApiError("VALIDATION_ERROR", "FULL refund must approve the full payment amount.", 400)
+        if refund["refund_type"] == "PARTIAL" and approved >= Decimal(payment["amount"]):
+            raise ApiError("VALIDATION_ERROR", "PARTIAL refund must approve less than the payment amount.", 400)
+        if _refund_reserved_amount(payment_id, refund_id) + approved > Decimal(payment["amount"]):
+            raise ApiError("OVER_REFUND", "Refund approval would exceed the payment amount.", 409, {"payment_amount": payment["amount"]})
+        prior_status = payment["status"]
+        form = _refund_ledger_form(payment["booking_id"])
+        execute(
+            """
+            UPDATE edutrust.refunds
+            SET status='APPROVED', approved_amount=%s, approved_at=now(), approved_by_user_id=%s,
+                approved_by_role=%s, teacher_adjustment_amount=%s, platform_adjustment_amount=%s,
+                reason_code=COALESCE(%s, reason_code),
+                metadata = metadata || jsonb_build_object('payment_status_before_refund', %s::text)
+            WHERE id=%s
+            """,
+            [str(approved), user_id, actor_role, str(teacher_adj), str(platform_adj), reason_code, prior_status, refund_id],
+        )
+        execute("UPDATE edutrust.payments SET status='REFUND_PENDING', updated_at=now() WHERE id=%s", [payment_id])
+        _create_refund_ledger_draft(refund_id, payment_id, payment["booking_id"], form, approved, teacher_adj, platform_adj)
+        write_event("REFUND_APPROVED", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id,
+                    metadata={"approved_amount": str(approved), "teacher_adjustment_amount": str(teacher_adj),
+                              "platform_adjustment_amount": str(platform_adj), "ledger_form": form})
+        write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"action": "REFUND_APPROVED", "ledger_form": form})
+    # Outside the DB transaction (API 12.6): DEV mock provider call (D1).
+    submission = MockPaymentProvider().initiate_refund(payment_id=payment_id, amount=str(approved), currency=payment["currency"])
+    # TX2: record provider event + PROVIDER_PENDING + REFUND_PROVIDER_SUBMITTED.
+    with tx():
+        refund = _refund_row_for_update(refund_id)
+        if refund["status"] != "APPROVED":
+            raise ApiError("REFUND_INVALID_STATE",
+                           "Refund is no longer APPROVED; submission aborted. Operator may cancel and create a new refund.",
+                           409, {"refund_status": refund["status"]})
+        event = fetchone(
+            """
+            INSERT INTO edutrust.payment_provider_events (provider, provider_event_id, provider_refund_id,
+                                                          event_type, status, refund_id, amount, currency, normalized_payload)
+            VALUES (%s::edutrust.payment_provider, %s, %s, 'refund.initiated', 'RECEIVED', %s, %s, %s, %s::jsonb)
+            RETURNING id::text
+            """,
+            [payment["provider"], f"mock_evt_{uuid.uuid4()}", submission["provider_refund_id"],
+             refund_id, str(approved), payment["currency"], '{"provider":"MockPaymentProvider"}'],
+        )
+        execute("UPDATE edutrust.payment_provider_events SET status='PROCESSING', processing_attempts=processing_attempts+1, updated_at=now() WHERE id=%s", [event["id"]])
+        execute("UPDATE edutrust.refunds SET status='PROVIDER_PENDING', provider_refund_id=%s, provider_submitted_at=now(), updated_at=now() WHERE id=%s",
+                [submission["provider_refund_id"], refund_id])
+        execute("UPDATE edutrust.payment_provider_events SET status='PROCESSED', processed_at=now(), updated_at=now() WHERE id=%s", [event["id"]])
+        write_event("REFUND_PROVIDER_SUBMITTED", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"provider_refund_id": submission["provider_refund_id"], "dev_mock": True})
+        response = {"refund": _refund_detail(refund_id), "payment_status": "REFUND_PENDING"}
+        _idempotency_complete("refund_approve", user_id, idempotency_key, 200, response, "refund", refund_id)
+    return response
+
+
+def _refund_close_simple(user_id: str, roles: list[str], refund_id: str, data: dict, idempotency_key: str | None,
+                         scope: str, transition: str, to_status: str, from_status: tuple[str, ...],
+                         reason_field: str, event_type: str, action: str, metadata_key: str,
+                         request_id: str | None = None) -> dict:
+    import json
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    reason = str(data.get(reason_field) or "").strip()
+    if len(reason) < 3:
+        raise ApiError("VALIDATION_ERROR", f"{reason_field} must be at least 3 characters.", 400)
+    _refund_require_key(idempotency_key)
+    canonical = {"refund_id": str(refund_id), reason_field: reason}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    with tx():
+        replay = _idempotency_begin(scope, user_id, idempotency_key, request_hash, f"/api/v1/admin/refunds/{refund_id}/{transition}")
+        if replay:
+            return replay["response_body"]
+        refund_payment_row = fetchone("SELECT payment_id::text FROM edutrust.refunds WHERE id=%s", [refund_id])
+        if not refund_payment_row:
+            raise ApiError("RESOURCE_NOT_FOUND", "Refund not found.", 404)
+        payment_id = refund_payment_row["payment_id"]
+        payment = _refund_payment_for_update(payment_id)
+        refund = _refund_row_for_update(refund_id)
+        if refund["status"] not in from_status:
+            raise ApiError("REFUND_INVALID_STATE",
+                           f"Refund must be one of {', '.join(from_status)} for {transition} (current: {refund['status']}).",
+                           409, {"refund_status": refund["status"]})
+        timestamp = "rejected_at" if transition == "reject" else "cancelled_at"
+        execute(
+            f"""
+            UPDATE edutrust.refunds
+            SET status=%s, {timestamp}=now(),
+                metadata = metadata || jsonb_build_object(%s, %s::text)
+            WHERE id=%s
+            """,
+            [to_status, metadata_key, reason, refund_id],
+        )
+        payment_status = payment["status"]
+        if transition == "cancel" and refund["status"] == "APPROVED":
+            # Payment was moved to REFUND_PENDING at approval; restore it
+            # (SM 7.6 refund-failure handling) and void the draft ledger.
+            prior = _refund_prior_payment_status(refund)
+            execute("UPDATE edutrust.payments SET status=%s, updated_at=now() WHERE id=%s", [prior, payment_id])
+            payment_status = prior
+            _set_refund_ledger_status(refund_id, "VOIDED")
+        write_event(event_type, "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={metadata_key: reason})
+        write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"action": action, "refund_status": to_status})
+        response = {"refund": _refund_detail(refund_id), "payment_status": payment_status}
+        _idempotency_complete(scope, user_id, idempotency_key, 200, response, "refund", refund_id)
+    return response
+
+
+def reject_refund(user_id: str, roles: list[str], refund_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    return _refund_close_simple(user_id, roles, refund_id, data, idempotency_key,
+                                 "refund_reject", "reject", "REJECTED", ("REQUESTED",), "reason",
+                                 "REFUND_REJECTED", "REFUND_REJECTED", "rejection_reason", request_id)
+
+
+def cancel_refund(user_id: str, roles: list[str], refund_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    return _refund_close_simple(user_id, roles, refund_id, data, idempotency_key,
+                                 "refund_cancel", "cancel", "CANCELLED", ("REQUESTED", "APPROVED"), "reason",
+                                 "REFUND_CANCELLED", "REFUND_CANCELLED", "cancellation_reason", request_id)
+
+
+def process_mock_refund_result(user_id: str, roles: list[str], refund_id: str, outcome: str,
+                               provider_event_id: str | None = None, request_id: str | None = None) -> dict:
+    if not settings.MOCK_PAYMENT_PROVIDER_ENABLED or settings.REAL_PAYMENT_ENABLED:
+        raise ApiError("FORBIDDEN", "Mock provider controls are DEV-only.", 403)
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    if outcome not in ("succeeded", "failed"):
+        raise ApiError("VALIDATION_ERROR", "outcome must be succeeded or failed.", 400)
+    provider_event_id = str(provider_event_id or f"mock_evt_{uuid.uuid4()}")
+    event_kind = "refund.succeeded" if outcome == "succeeded" else "refund.failed"
+    conflict_ctx: dict | None = None
+    try:
+      with tx():
+        # Event identity first (Addendum 15.1), VS2 pattern: provider fixed
+        # to 'OTHER' (the mock provider identity in this DEV deployment).
+        existing_event = fetchone(
+            "SELECT id::text, status::text, refund_id::text, provider_refund_id FROM edutrust.payment_provider_events "
+            "WHERE provider='OTHER' AND provider_event_id=%s FOR UPDATE",
+            [provider_event_id],
+        )
+        refund = _refund_row_for_update(refund_id)
+        # Identity conflict first (SM 7.8): the provider event identity is
+        # already linked to a different refund (or is a non-refund event).
+        if existing_event and str(existing_event["refund_id"]) != str(refund_id):
+            # REJECTED is only settable from non-terminal states (v1.2 lifecycle
+            # guard); terminal rows are already the audit trail.
+            if existing_event["status"] in ("RECEIVED", "PROCESSING"):
+                execute("UPDATE edutrust.payment_provider_events SET status='REJECTED', last_error_code='PAYMENT_PROVIDER_CONFLICT', updated_at=now() WHERE id=%s", [existing_event["id"]])
+            conflict_ctx = {"refund_id": refund_id, "provider_event_id": provider_event_id}
+            raise ApiError("PAYMENT_PROVIDER_CONFLICT", "Provider event identity is already linked to a different refund.", 409)
+        # SM 7.8: an already-PROCESSED provider event replays as 200 with the
+        # recorded outcome, no state re-mutation — checked before any
+        # refund-state precondition.
+        if existing_event and existing_event["status"] == "PROCESSED":
+            payment_now = fetchone("SELECT status::text FROM edutrust.payments WHERE id=%s", [refund["payment_id"]])
+            return {
+                "duplicate": True,
+                "provider_event_id": provider_event_id,
+                "refund_id": refund_id,
+                "refund_status": refund["status"],
+                "payment_status": payment_now["status"],
+            }
+        payment = _refund_payment_for_update(refund["payment_id"])
+        if refund["status"] != "PROVIDER_PENDING":
+            raise ApiError("REFUND_INVALID_STATE", f"Refund must be PROVIDER_PENDING for a provider result (current: {refund['status']}).", 409, {"refund_status": refund["status"]})
+        if existing_event:
+            if existing_event["status"] in ("RECEIVED", "PROCESSING"):
+                raise ApiError("PAYMENT_PROVIDER_EVENT_IN_PROGRESS", "Provider event is already being processed or rejected.", 409)
+            event_id = existing_event["id"]
+            execute("UPDATE edutrust.payment_provider_events SET status='PROCESSING', processing_attempts=processing_attempts+1, updated_at=now() WHERE id=%s", [event_id])
+        else:
+            event = fetchone(
+                """
+                INSERT INTO edutrust.payment_provider_events (provider, provider_event_id, provider_refund_id,
+                                                              event_type, status, refund_id, amount, currency, normalized_payload)
+                VALUES ('OTHER', %s, %s, %s, 'RECEIVED', %s, %s, %s, %s::jsonb)
+                RETURNING id::text
+                """,
+                [provider_event_id, refund["provider_refund_id"], event_kind, refund_id,
+                 refund["approved_amount"], refund["currency"], '{"provider":"MockPaymentProvider"}'],
+            )
+            event_id = event["id"]
+            execute("UPDATE edutrust.payment_provider_events SET status='PROCESSING', processing_attempts=processing_attempts+1, updated_at=now() WHERE id=%s", [event_id])
+        if outcome == "succeeded":
+            execute("UPDATE edutrust.refunds SET status='SUCCEEDED', completed_at=now(), updated_at=now() WHERE id=%s", [refund_id])
+            new_payment_status = _refund_payment_status_after_success(payment["id"])
+            execute("UPDATE edutrust.payments SET status=%s, refunded_at=now(), updated_at=now() WHERE id=%s", [new_payment_status, payment["id"]])
+            _set_refund_ledger_status(refund_id, "POSTED")
+            write_event("REFUND_SUCCEEDED", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"provider_event_id": provider_event_id, "dev_mock": True})
+            payment_event = "PAYMENT_REFUNDED" if new_payment_status == "REFUNDED" else "PAYMENT_PARTIALLY_REFUNDED"
+            write_event(payment_event, "payment", payment["id"], actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"refund_id": refund_id, "dev_mock": True})
+            write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"action": "REFUND_MOCK_SUCCEEDED", "provider_event_id": provider_event_id})
+            refund_status, payment_status = "SUCCEEDED", new_payment_status
+        else:
+            prior = _refund_prior_payment_status(refund)
+            execute(
+                "UPDATE edutrust.refunds SET status='FAILED', failed_at=now(), failure_code='PROVIDER_REFUND_FAILED', "
+                "failure_message='Mock provider refund failure (DEV).', updated_at=now() WHERE id=%s",
+                [refund_id],
+            )
+            execute("UPDATE edutrust.payments SET status=%s, updated_at=now() WHERE id=%s", [prior, payment["id"]])
+            _set_refund_ledger_status(refund_id, "VOIDED")
+            write_event("REFUND_FAILED", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"failure_code": "PROVIDER_REFUND_FAILED", "provider_event_id": provider_event_id})
+            write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"action": "REFUND_MOCK_FAILED", "provider_event_id": provider_event_id})
+            refund_status, payment_status = "FAILED", prior
+        execute("UPDATE edutrust.payment_provider_events SET status='PROCESSED', processed_at=now(), updated_at=now() WHERE id=%s", [event_id])
+      return {
+        "duplicate": False,
+        "provider_event_id": provider_event_id,
+        "refund_id": refund_id,
+        "refund_status": refund_status,
+        "payment_status": payment_status,
+    }
+    except ApiError as exc:
+        if conflict_ctx is not None:
+            # Audit the conflict in its own committed transaction (the main
+            # transaction rolled back).
+            try:
+                with tx():
+                    write_security_event("SUSPICIOUS_ACTIVITY", user_id=user_id, severity=2,
+                                         metadata={"entity": "refund", "entity_id": conflict_ctx["refund_id"],
+                                                   "provider_event_id": conflict_ctx["provider_event_id"],
+                                                   "request_id": request_id})
+            except Exception:
+                pass
+        raise
+
+
+def reconcile_refund(user_id: str, roles: list[str], refund_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    from django.utils import dateparse
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    result = str(data.get("result") or "").upper()
+    source = str(data.get("reconciliation_source") or "").strip()
+    reference = str(data.get("reconciliation_reference") or "").strip()
+    reconciled_at_raw = data.get("reconciled_at")
+    reason = str(data.get("reason") or "").strip()
+    evidence = data.get("supporting_evidence") or []
+    if result not in ("SUCCEEDED", "FAILED"):
+        raise ApiError("VALIDATION_ERROR", "result must be SUCCEEDED or FAILED.", 400)
+    if not source:
+        raise ApiError("REFUND_RECONCILIATION_PROOF_REQUIRED", "reconciliation_source is required.", 400)
+    if not reference:
+        raise ApiError("REFUND_RECONCILIATION_PROOF_REQUIRED", "reconciliation_reference must be non-empty.", 400)
+    if not reconciled_at_raw:
+        raise ApiError("REFUND_RECONCILIATION_PROOF_REQUIRED", "reconciled_at is required.", 400)
+    reconciled_at = dateparse.parse_datetime(str(reconciled_at_raw))
+    if reconciled_at is None:
+        raise ApiError("VALIDATION_ERROR", "reconciled_at must be an ISO-8601 timestamp.", 400)
+    if len(reason) < 3:
+        raise ApiError("VALIDATION_ERROR", "reason must be at least 3 characters.", 400)
+    if not isinstance(evidence, list):
+        raise ApiError("VALIDATION_ERROR", "supporting_evidence must be a list of references.", 400)
+    if source == "ADMIN_OVERRIDE" and "ADMIN" not in roles:
+        raise ApiError("FORBIDDEN", "ADMIN_OVERRIDE reconciliation requires ADMIN authority.", 403)
+    _refund_require_key(idempotency_key)
+    canonical = {"refund_id": str(refund_id), "result": result, "reconciliation_source": source,
+                 "reconciliation_reference": reference, "reconciled_at": str(reconciled_at), "reason": reason,
+                 "supporting_evidence": evidence}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    # PLAN-LOCK: reconcile is allowed from PROVIDER_PENDING only (the only
+    # state that legally reaches a terminal state via reconciliation).
+    with tx():
+        replay = _idempotency_begin("refund_reconcile", user_id, idempotency_key, request_hash, f"/api/v1/admin/refunds/{refund_id}/reconcile")
+        if replay:
+            return replay["response_body"]
+        refund_payment_row = fetchone("SELECT payment_id::text FROM edutrust.refunds WHERE id=%s", [refund_id])
+        if not refund_payment_row:
+            raise ApiError("RESOURCE_NOT_FOUND", "Refund not found.", 404)
+        payment_id = refund_payment_row["payment_id"]
+        payment = _refund_payment_for_update(payment_id)
+        refund = _refund_row_for_update(refund_id)
+        if refund["status"] != "PROVIDER_PENDING":
+            raise ApiError("REFUND_INVALID_STATE", f"Refund must be PROVIDER_PENDING to reconcile (current: {refund['status']}).", 409, {"refund_status": refund["status"]})
+        if result == "SUCCEEDED":
+            execute(
+                "UPDATE edutrust.refunds SET status='SUCCEEDED', completed_at=now(), reconciliation_source=%s, "
+                "reconciliation_reference=%s, reconciled_at=%s, reconciled_by_user_id=%s, updated_at=now() WHERE id=%s",
+                [source, reference, reconciled_at, user_id, refund_id],
+            )
+            new_payment_status = _refund_payment_status_after_success(payment["id"])
+            execute("UPDATE edutrust.payments SET status=%s, refunded_at=now(), updated_at=now() WHERE id=%s", [new_payment_status, payment["id"]])
+            _set_refund_ledger_status(refund_id, "POSTED")
+            write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"action": "REFUND_RECONCILED", "reconciliation_source": source,
+                                                         "reconciliation_reference": reference})
+            write_event("REFUND_SUCCEEDED", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"reconciliation_source": source})
+            payment_event = "PAYMENT_REFUNDED" if new_payment_status == "REFUNDED" else "PAYMENT_PARTIALLY_REFUNDED"
+            write_event(payment_event, "payment", payment["id"], actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"refund_id": refund_id})
+            payment_status = new_payment_status
+        else:
+            prior = _refund_prior_payment_status(refund)
+            execute(
+                "UPDATE edutrust.refunds SET status='FAILED', failed_at=now(), failure_code='RECONCILIATION_FAILED', "
+                "failure_message=%s, reconciliation_source=%s, reconciliation_reference=%s, reconciled_at=%s, "
+                "reconciled_by_user_id=%s, updated_at=now() WHERE id=%s",
+                [reason, source, reference, reconciled_at, user_id, refund_id],
+            )
+            execute("UPDATE edutrust.payments SET status=%s, updated_at=now() WHERE id=%s", [prior, payment["id"]])
+            _set_refund_ledger_status(refund_id, "VOIDED")
+            write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"action": "REFUND_RECONCILED", "reconciliation_source": source,
+                                                         "reconciliation_reference": reference})
+            write_event("REFUND_FAILED", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                        request_id=request_id, metadata={"reconciliation_source": source})
+            payment_status = prior
+        response = {"refund": _refund_detail(refund_id), "payment_status": payment_status}
+        _idempotency_complete("refund_reconcile", user_id, idempotency_key, 200, response, "refund", refund_id)
+    return response
+
+
+def list_admin_refunds(user_id: str, roles: list[str], params: dict, request_id: str | None = None) -> dict:
+    # Addendum 7.1: ordinary list read generates no event; sensitive
+    # drilldown is audited in the detail endpoint.
+    conds: list[str] = []
+    sql_params: list = []
+    for field, column in (("status", "r.status::text"), ("provider", "r.provider::text"),
+                          ("dispute_id", "r.dispute_id::text"), ("payment_id", "r.payment_id::text")):
+        value = str(params.get(field) or "").strip()
+        if value:
+            conds.append(f"{column}=%s")
+            sql_params.append(value)
+    frm = str(params.get("from") or "").strip()
+    to = str(params.get("to") or "").strip()
+    if frm:
+        conds.append("r.created_at >= %s")
+        sql_params.append(frm)
+    if to:
+        conds.append("r.created_at <= %s")
+        sql_params.append(to)
+    try:
+        limit = max(1, min(int(params.get("limit") or 20), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    cursor = str(params.get("cursor") or "").strip()
+    if cursor:
+        conds.append("r.created_at < (SELECT created_at FROM edutrust.refunds WHERE id=%s)")
+        sql_params.append(cursor)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    rows = fetchall(
+        f"""
+        SELECT r.id::text, r.payment_id::text, r.booking_id::text, r.dispute_id::text, r.provider::text,
+               r.refund_type::text, r.status::text, r.requested_amount::text, r.approved_amount::text,
+               r.currency, r.reason_code, r.created_at
+        FROM edutrust.refunds r{where}
+        ORDER BY r.created_at DESC, r.id
+        LIMIT {limit + 1}
+        """,
+        sql_params,
+    )
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = [_serialize_row(_refund_list_item(r)) for r in rows]
+    return {
+        "data": items,
+        "pagination": {"limit": limit, "next_cursor": items[-1]["refund_id"] if has_more else None, "has_more": has_more},
+    }
+
+
+def get_admin_refund(user_id: str, roles: list[str], refund_id: str, request_id: str | None = None) -> dict:
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    write_event("ADMIN_ACTION", "refund", refund_id, actor_user_id=user_id, actor_role=actor_role,
+                request_id=request_id, metadata={"action": "READ_REFUND_DETAIL"})
+    write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2,
+                         metadata={"entity": "refund", "entity_id": refund_id, "request_id": request_id})
+    detail = _refund_detail(refund_id)
+    events = fetchall(
+        """
+        SELECT provider_event_id, provider_refund_id, event_type, status::text, received_at, processed_at
+        FROM edutrust.payment_provider_events WHERE refund_id=%s ORDER BY received_at
+        """,
+        [refund_id],
+    )
+    detail["provider_event_summary"] = _serialize_row_rows(events)
+    return detail

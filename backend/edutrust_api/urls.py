@@ -59,4 +59,15 @@ urlpatterns = [
     path("admin/teachers/<uuid:teacher_id>/verifications", views.admin_teacher_verifications),
     path("admin/teachers/<uuid:teacher_id>/verify", views.admin_teacher_verify),
     path("admin/teachers/<uuid:teacher_id>/reject", views.admin_teacher_reject),
+
+    # Vertical Slice 8: refund operations (DEV mock)
+    path("payments/<uuid:payment_id>/refund", views.payments_refund),
+    path("admin/refunds", views.admin_refunds),
+    path("admin/refunds/<uuid:refund_id>", views.admin_refund_detail),
+    path("admin/refunds/<uuid:refund_id>/approve", views.admin_refund_approve),
+    path("admin/refunds/<uuid:refund_id>/reject", views.admin_refund_reject),
+    path("admin/refunds/<uuid:refund_id>/cancel", views.admin_refund_cancel),
+    path("admin/refunds/<uuid:refund_id>/mock/succeed", views.admin_refund_mock_succeed),
+    path("admin/refunds/<uuid:refund_id>/mock/fail", views.admin_refund_mock_fail),
+    path("admin/refunds/<uuid:refund_id>/reconcile", views.admin_refund_reconcile),
 ]

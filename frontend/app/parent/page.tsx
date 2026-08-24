@@ -22,7 +22,13 @@ export default function ParentDashboardShell() {
   const [disputeCategory, setDisputeCategory] = useState('SESSION_QUALITY')
   const [disputeDesc, setDisputeDesc] = useState('')
   const [myDisputes, setMyDisputes] = useState<any[]>([])
+  const [refundState, setRefundState] = useState('')
   const addLog = (m: string) => setLog((l) => [m, ...l].slice(0, 12))
+  // UX v1.1 Patch 1 parent-facing labels; "completed" (refunded) only when SUCCEEDED.
+  const REFUND_PARENT_LABEL: Record<string, string> = {
+    REQUESTED: 'Refund requested', APPROVED: 'Refund approved', PROVIDER_PENDING: 'Refund processing',
+    SUCCEEDED: 'Refund completed', FAILED: 'Refund failed', REJECTED: 'Refund rejected', CANCELLED: 'Refund cancelled',
+  }
   async function registerLogin() {
     await apiPost('/api/v1/auth/register', { role: 'PARENT', full_name: 'Parent User', email, password })
     const res: any = await apiPost('/api/v1/auth/login', { identifier: email, password })
@@ -53,6 +59,18 @@ export default function ParentDashboardShell() {
   async function mockPaymentFailure() {
     const res: any = await apiPost(`/api/v1/payments/${paymentId}/mock/fail`, { provider_event_id: `evt-${crypto.randomUUID()}` }, token)
     addLog(`Payment ${res.data.payment_status}; booking ${res.data.booking_status}`)
+  }
+  async function viewRefundStatus() {
+    try {
+      const res: any = await apiGet(`/api/v1/payments/${paymentId}`, token)
+      const refunds = res.data?.refunds || []
+      if (refunds.length === 0) { setRefundState('No refund activity on this payment'); addLog('Refund status: none') }
+      else {
+        const labels = refunds.map((r: any) => `${REFUND_PARENT_LABEL[r.status] || r.status}${r.approved_amount ? ` (${r.approved_amount} ${r.currency})` : ''}`).join(', ')
+        setRefundState(`Payment ${res.data.status} — ${labels}`)
+        addLog(`Refund status: ${labels}`)
+      }
+    } catch (e: any) { setRefundState(`Refund status rejected: ${e.message}`); addLog(`Refund status rejected: ${e.message}`) }
   }
   async function listBookings() {
     const res: any = await apiGet('/api/v1/bookings', token)
@@ -104,7 +122,7 @@ export default function ParentDashboardShell() {
       <div className="card"><h2>1. Login</h2><input value={email} onChange={e=>setEmail(e.target.value)} style={{width:'100%',padding:8}}/><br/><br/><button className="primary" onClick={registerLogin}>Register/Login</button></div>
       <div className="card"><h2>2. Student</h2><button className="primary" onClick={createStudent} disabled={!token}>Create student</button><p className="muted">{studentId || 'No student yet'}</p></div>
       <div className="card"><h2>3. Search</h2><button className="primary" onClick={searchTeachers} disabled={!token}>Search teachers</button><p className="muted">slot {slotId || '-'}</p></div>
-      <div className="card"><h2>4. Booking</h2><button className="primary" onClick={holdBooking} disabled={!studentId || !slotId}>Hold slot</button> <button onClick={initiatePayment} disabled={!bookingId}>Initiate payment</button> <button onClick={mockPaymentSuccess} disabled={!paymentId}>Mock success</button> <button onClick={mockPaymentFailure} disabled={!paymentId}>Mock fail</button> <button onClick={listBookings} disabled={!token}>History</button> <button onClick={viewSession} disabled={!sessionId}>Session</button> <button onClick={viewReport} disabled={!sessionId}>Report</button></div>
+      <div className="card"><h2>4. Booking</h2><button className="primary" onClick={holdBooking} disabled={!studentId || !slotId}>Hold slot</button> <button onClick={initiatePayment} disabled={!bookingId}>Initiate payment</button> <button onClick={mockPaymentSuccess} disabled={!paymentId}>Mock success</button> <button onClick={mockPaymentFailure} disabled={!paymentId}>Mock fail</button> <button onClick={listBookings} disabled={!token}>History</button> <button onClick={viewSession} disabled={!sessionId}>Session</button> <button onClick={viewReport} disabled={!sessionId}>Report</button> <button onClick={viewRefundStatus} disabled={!paymentId}>Refund status</button><p className="muted">{refundState || 'No refund activity yet'}</p></div>
     </section>
     <section className="card"><span className="badge success">VS4 — Verified Review + Dispute</span><h2>VS4 · Review &amp; Dispute</h2>
       <p className="muted">Completed sessions are review-eligible (server checks booking/payment state). Verification is derived by the server.</p>
