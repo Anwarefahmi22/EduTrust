@@ -324,3 +324,18 @@ def admin_payouts(request):
     from .services import list_admin_payouts
     return Response({"data": list_admin_payouts(request.user.id, request.user.roles, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
 
+# ---- Vertical Slice 6 views: review moderation ----
+
+@api_view(["GET"])
+@require_roles("SUPPORT", "OPS", "ADMIN")
+def admin_reviews(request):
+    from .services import list_admin_reviews
+    return Response({"data": list_admin_reviews(request.user.id, request.user.roles, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_reviews_moderate(request, review_id: str):
+    from .services import moderate_review
+    data = moderate_review(request.user.id, request.user.roles, review_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})

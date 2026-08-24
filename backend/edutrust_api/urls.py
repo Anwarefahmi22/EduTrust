@@ -49,4 +49,7 @@ urlpatterns = [
     path("admin/payouts/process", views.admin_payouts_process),
     path("admin/payouts", views.admin_payouts),
 
+    # Vertical Slice 6: review moderation
+    path("admin/reviews/<uuid:review_id>/moderate", views.admin_reviews_moderate),
+    path("admin/reviews", views.admin_reviews),
 ]

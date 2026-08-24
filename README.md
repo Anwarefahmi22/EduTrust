@@ -241,7 +241,61 @@ Current automated backend tests:
 
 ```bash
 ./scripts/run_backend_tests.sh
-# 83 passed (54 baseline regression + 29 VS5)
+# 98 passed (83 baseline regression + 15 VS6)
+```
+
+## DEV Vertical Slice #6
+
+Implemented manual review moderation on the existing approved baseline (no schema, state-machine, or architecture changes):
+
+```text
+Operational review list → FLAG / HIDE / RESTORE / REMOVE → public visibility update → audit trail
+```
+
+- Transitions exactly per State Machines v1.0 §10.3: FLAG (VISIBLE→FLAGGED), HIDE (FLAGGED→HIDDEN), RESTORE (FLAGGED|HIDDEN→VISIBLE), REMOVE (→REMOVED, **ADMIN-only**; OPS gets 403).
+- No physical deletion: the review row, rating, and comment are always preserved (auditability per §10.4).
+- Public visibility continues to use the existing VS4 filter (`VISIBLE` + `is_verified`); moderation takes effect automatically.
+- Verified-review model fully preserved (server-derived verification, eligibility, ownership, privacy boundaries).
+- Automatic/system flagging is NOT implemented (no approved detection specification; out of scope).
+- Every moderation and operational read is audited (`ADMIN_ACTION` + `ADMIN_ACCESS`); Idempotency-Key mandatory on moderation (replay/conflict semantics).
+
+VS6 endpoints:
+
+```text
+GET  /api/v1/admin/reviews                  # SUPPORT/OPS/ADMIN (audited)
+POST /api/v1/admin/reviews/:id/moderate     # OPS/ADMIN; REMOVE ADMIN-only
+```
+
+Strict boundaries (unchanged):
+
+```text
+Real payment: forbidden
+Real payout: forbidden
+Production: forbidden
+```
+
+## DEV Vertical Slice #5
+
+Implemented the payout lifecycle on the existing approved baseline (MANUAL_OPS / MOCK execution only; no schema, state-machine, or architecture changes):
+
+```text
+Completed eligible session → Eligibility → Calculation → Payout Item → PENDING →
+Admin/Ops Processing → PROCESSING → mock execution → PAID / FAILED →
+Ledger → Event Ledger → Audit → Visibility → PAID immutability (DB-enforced)
+```
+
+- Payouts are processed exclusively by OPS/ADMIN through `POST /api/v1/admin/payouts/process` (mandatory `Idempotency-Key: payout-<uuid>`); DEV execution is mock/manual-ops — no real payout provider, no real money, no credentials (approved decision U1). PENDING batches are Admin/Ops-initiated — no scheduled jobs (approved decision U2).
+- Net-payable calculation per the authoritative Addendum: gross (price − booking commission) minus APPROVED/PROVIDER_PENDING/SUCCEEDED partial-refund teacher adjustments; net = 0 blocks the session.
+- Blocked path: open dispute blocks payout at service level and via the existing DB trigger; the dispute overlay never changes booking/session status.
+- PAID payout rows are DB-immutable (v1.4 trigger); failed batches void the DRAFT ledger transaction (never posted → no funds moved). Post-paid correction is represented by the existing adjustment/recovery ledger model only — no recovery workflow in VS5.
+
+VS5 endpoints:
+
+```text
+GET  /api/v1/teacher/payouts           # TEACHER own payouts
+GET  /api/v1/teacher/payouts/:id       # TEACHER own payout detail (no provider reference)
+POST /api/v1/admin/payouts/process     # OPS/ADMIN, Idempotency-Key required, mock execution
+GET  /api/v1/admin/payouts             # OPS/ADMIN operational (audited)
 ```
 
 Strict boundaries (unchanged):

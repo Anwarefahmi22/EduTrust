@@ -1659,3 +1659,99 @@ def list_admin_payouts(user_id: str, roles: list[str], request_id: str | None = 
         """,
     )
 
+# ---- Vertical Slice 6 review moderation services ----
+#
+# Baselines implemented here (no new business rules, no schema/state changes):
+# - State Machines v1.0 section 10.3: manual OPS/Admin moderation transitions
+#   VISIBLE->FLAGGED (FLAG), FLAGGED->HIDDEN (HIDE), FLAGGED|HIDDEN->VISIBLE
+#   (RESTORE), any-of-VISIBLE/FLAGGED/HIDDEN->REMOVED (REMOVE, Admin only);
+#   "Lock review"; event ADMIN_ACTION; review record preserved.
+# - State Machines v1.0 section 10.4: no physical deletion — status-based only.
+# - API Architecture 18.1/18.4/21.4: POST /admin/reviews/:id/moderate (OPS/ADMIN,
+#   "Moderation must be audited"), GET /admin/reviews (SUPPORT/OPS/ADMIN);
+#   verified rating not silently deleted.
+# - VS4 verified-review model preserved: is_verified stays server-derived
+#   (DB CHECK is_verified = TRUE); moderation updates status only.
+# - System/automatic flagging is OUT OF SCOPE (no approved detection spec).
+
+MODERATION_TRANSITIONS = {
+    "FLAG": {"from": {"VISIBLE"}, "to": "FLAGGED", "admin_only": False},
+    "HIDE": {"from": {"FLAGGED"}, "to": "HIDDEN", "admin_only": False},
+    "RESTORE": {"from": {"FLAGGED", "HIDDEN"}, "to": "VISIBLE", "admin_only": False},
+    "REMOVE": {"from": {"VISIBLE", "FLAGGED", "HIDDEN"}, "to": "REMOVED", "admin_only": True},
+}
+
+
+def _moderation_review_row(review_id: str) -> dict:
+    return fetchone(
+        """
+        SELECT r.id::text, r.session_id::text, r.booking_id::text, r.teacher_id::text, r.rating, r.comment,
+               r.status::text, r.is_verified, r.created_at,
+               tp.public_name AS teacher_public_name, sp.display_name AS student_display_name
+        FROM edutrust.reviews r
+        JOIN edutrust.teacher_profiles tp ON tp.id=r.teacher_id
+        JOIN edutrust.student_profiles sp ON sp.id=r.student_id
+        WHERE r.id=%s FOR UPDATE
+        """,
+        [review_id],
+    )
+
+
+def moderate_review(user_id: str, roles: list[str], review_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    action = str(data.get("action") or "").upper()
+    reason = (data.get("reason") or "").strip()
+    if action not in MODERATION_TRANSITIONS:
+        raise ApiError("VALIDATION_ERROR", "action must be one of FLAG, HIDE, RESTORE, REMOVE.", 400)
+    if not reason:
+        raise ApiError("VALIDATION_ERROR", "reason is required.", 400)
+    transition = MODERATION_TRANSITIONS[action]
+    if transition["admin_only"] and "ADMIN" not in roles:
+        raise ApiError("FORBIDDEN", "REMOVE requires ADMIN authority.", 403)
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    canonical = {"review_id": str(review_id), "action": action, "reason": reason}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    with tx():
+        replay = _idempotency_begin("review_moderate", user_id, idempotency_key, request_hash, f"/api/v1/admin/reviews/{review_id}/moderate")
+        if replay:
+            return replay["response_body"]
+        review = _moderation_review_row(review_id)
+        if not review:
+            raise ApiError("RESOURCE_NOT_FOUND", "Review not found.", 404)
+        if review["status"] not in transition["from"]:
+            raise ApiError(
+                "INVALID_STATE_TRANSITION",
+                f"Action {action} is not allowed from status {review['status']}.",
+                422,
+                {"current_status": review["status"]},
+            )
+        # Status-only update: rating/comment/is_verified/session linkage untouched.
+        execute(
+            "UPDATE edutrust.reviews SET status=%s::edutrust.review_status, updated_at=now() WHERE id=%s",
+            [transition["to"], review_id],
+        )
+        write_event(
+            "ADMIN_ACTION", "review", review_id,
+            actor_user_id=user_id, actor_role=actor_role, request_id=request_id,
+            metadata={"action": f"MODERATE_{action}", "reason": reason, "from_status": review["status"], "to_status": transition["to"]},
+        )
+        response = {"review": _serialize_row(_moderation_review_row(review_id))}
+        _idempotency_complete("review_moderate", user_id, idempotency_key, 200, response, "review", review_id)
+    return response
+
+
+def list_admin_reviews(user_id: str, roles: list[str], request_id: str | None = None) -> list[dict]:
+    actor_role = "ADMIN" if "ADMIN" in roles else ("OPS" if "OPS" in roles else "SUPPORT")
+    write_event("ADMIN_ACTION", "reviews", None, actor_user_id=user_id, actor_role=actor_role, request_id=request_id, metadata={"action": "READ_REVIEW_LIST"})
+    write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "reviews", "request_id": request_id})
+    return fetchall(
+        """
+        SELECT r.id::text, r.session_id::text, r.booking_id::text, r.teacher_id::text, r.rating, r.comment,
+               r.status::text, r.is_verified, r.created_at,
+               tp.public_name AS teacher_public_name, sp.display_name AS student_display_name
+        FROM edutrust.reviews r
+        JOIN edutrust.teacher_profiles tp ON tp.id=r.teacher_id
+        JOIN edutrust.student_profiles sp ON sp.id=r.student_id
+        ORDER BY r.created_at DESC LIMIT 100
+        """,
+    )

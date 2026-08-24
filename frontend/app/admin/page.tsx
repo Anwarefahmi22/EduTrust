@@ -14,6 +14,10 @@ export default function AdminDashboardShell() {
   const [payoutSessionIds, setPayoutSessionIds] = useState('')
   const [forceFail, setForceFail] = useState(false)
   const [payoutResult, setPayoutResult] = useState('')
+  const [modReviews, setModReviews] = useState<any[]>([])
+  const [modAction, setModAction] = useState('')
+  const [modReason, setModReason] = useState('')
+  const [modResult, setModResult] = useState('')
   const addLog = (m: string) => setLog((l) => [m, ...l].slice(0, 12))
   async function loginOnly() { const res:any=await apiPost('/api/v1/auth/login',{identifier:email,password}); setToken(res.data.access_token); addLog('Admin logged in') }
   async function securityEvents() { const res:any=await apiGet('/api/v1/admin/security-events',token); addLog(`Security events ${res.data.count}`) }
@@ -47,6 +51,21 @@ export default function AdminDashboardShell() {
     } catch (e: any) { setPayoutResult(`Payout rejected: ${e.message}`); addLog(`Payout rejected: ${e.message}`) }
   }
 
+  async function loadModReviews() {
+    const res: any = await apiGet('/api/v1/admin/reviews', token)
+    setModReviews(res.data || [])
+    addLog(`Reviews (operational): ${res.data.length} — access audited`)
+  }
+  async function moderate(reviewId: string, action: string) {
+    if (!modReason.trim()) { setModResult('Enter a reason before moderating'); return }
+    try {
+      const res: any = await apiPost(`/api/v1/admin/reviews/${reviewId}/moderate`, { action, reason: modReason.trim() }, token, `mod-${crypto.randomUUID()}`)
+      setModResult(`Moderation ${action} applied → status ${res.data.review.status} (audited)`)
+      addLog(`Moderated review ${reviewId}: ${action} → ${res.data.review.status}`)
+      loadModReviews()
+    } catch (e: any) { setModResult(`Moderation rejected: ${e.message}`); addLog(`Moderation rejected: ${e.message}`) }
+  }
+
   return <>
     <section className="card"><span className="badge warning">Admin / OPS shell</span><h1>Admin Dashboard</h1><p className="muted">Admin users are seeded/created outside public registration. Sensitive access is logged.</p></section>
     <section className="grid"><div className="card"><h2>Login</h2><input value={email} onChange={e=>setEmail(e.target.value)} style={{width:'100%',padding:8}}/><br/><br/><button className="primary" onClick={loginOnly}>Login existing admin</button></div><div className="card"><h2>Audit</h2><button className="primary" onClick={securityEvents} disabled={!token}>Read security events</button> <button onClick={payments} disabled={!token}>Payments</button> <button onClick={events} disabled={!token}>Event ledger</button> <button onClick={sessions} disabled={!token}>Sessions</button><p className="muted">This access will be logged.</p></div></section>
@@ -68,6 +87,26 @@ export default function AdminDashboardShell() {
       <button onClick={processPayout} disabled={!token}>Process payout (mock)</button>
       {payoutResult && <p className="muted">{payoutResult}</p>}
       <p className="muted">No real payout provider, no real money. Idempotency-Key sent automatically; reads are audited.</p>
+    </section>
+    <section className="card"><span className="badge warning">VS6 — Review Moderation</span><h2>Review Moderation (operational)</h2>
+      <button className="primary" onClick={loadModReviews} disabled={!token}>Load reviews</button>
+      <ul>{modReviews.map(r => {
+        const actions = r.status === 'VISIBLE' ? ['FLAG', 'REMOVE'] : r.status === 'FLAGGED' ? ['HIDE', 'RESTORE', 'REMOVE'] : r.status === 'HIDDEN' ? ['RESTORE', 'REMOVE'] : []
+        return <li key={r.id}>
+          ★{r.rating} {r.teacher_public_name || ''} / {r.student_display_name || ''} — <b>{r.status}</b> (verified={r.is_verified})<br/>
+          <span className="muted">"{r.comment || ''}"</span>
+          {actions.length > 0 && <>
+            <select value={modAction && modAction.startsWith(r.id) ? modAction.split('|')[1] : ''} onChange={(e)=>setModAction(`${r.id}|${e.target.value}`)} style={{padding:4}}>
+              <option value="">action…</option>
+              {actions.map(a=><option key={a} value={a}>{a}</option>)}
+            </select>
+            <button onClick={()=>moderate(r.id, modAction.split('|')[1])} disabled={!modAction || !modAction.startsWith(r.id + '|') || modAction.split('|')[1]===''}>Moderate</button>
+          </>}
+        </li>
+      })}</ul>
+      <input placeholder="moderation reason (required)" value={modReason} onChange={e=>setModReason(e.target.value)} style={{width:'100%',padding:8}}/>
+      {modResult && <p className="muted">{modResult}</p>}
+      <p className="muted">REMOVE is ADMIN-only. Moderation is audited (ADMIN_ACTION + security events). Reviews are never physically deleted; public visibility follows the VISIBLE+verified filter.</p>
     </section>
     <section className="card"><h2>Activity</h2>{log.map((l,i)=><p key={i}>{l}</p>)}</section>
   </>
