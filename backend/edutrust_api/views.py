@@ -139,7 +139,7 @@ def teacher_profile(request, teacher_id: str):
 def teacher_trust_profile(request, teacher_id: str):
     from .services import teacher_public_profile
     p = teacher_public_profile(teacher_id)
-    return Response({"data": {"teacher_id": teacher_id, "verification_status": p["verification_status"], "completed_sessions_count": p["completed_sessions_count"], "verified_rating": p.get("verified_rating"), "review_count": p.get("review_count"), "attendance_rate": p.get("attendance_rate"), "cancellation_rate": p.get("cancellation_rate")}, "request_id": getattr(request, "request_id", None)})
+    return Response({"data": {"teacher_id": teacher_id, "verification_status": p["verification_status"], "identity_verified": p["identity_verified"], "qualifications_verified": p["qualifications_verified"], "completed_sessions_count": p["completed_sessions_count"], "verified_rating": p.get("verified_rating"), "review_count": p.get("review_count"), "attendance_rate": p.get("attendance_rate"), "cancellation_rate": p.get("cancellation_rate")}, "request_id": getattr(request, "request_id", None)})
 
 @api_view(["POST"])
 @require_roles("PARENT")
@@ -338,4 +338,45 @@ def admin_reviews(request):
 def admin_reviews_moderate(request, review_id: str):
     from .services import moderate_review
     data = moderate_review(request.user.id, request.user.roles, review_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+# ---- Vertical Slice 7 views: teacher verification ----
+
+@api_view(["GET", "POST"])
+@require_roles("TEACHER")
+def teacher_verifications(request):
+    from .services import list_verifications_for_teacher, submit_verification
+    if request.method == "POST":
+        data = submit_verification(request.user.id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+        return Response({"data": data, "request_id": getattr(request, "request_id", None)}, status=201)
+    return Response({"data": list_verifications_for_teacher(request.user.id), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("OPS", "ADMIN")
+def admin_teachers_pending_verification(request):
+    from .services import list_pending_verifications
+    return Response({"data": list_pending_verifications(request.user.id, request.user.roles, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("OPS", "ADMIN")
+def admin_teacher_verifications(request, teacher_id: str):
+    from .services import get_verifications_for_admin
+    return Response({"data": get_verifications_for_admin(request.user.id, request.user.roles, teacher_id, request_id=getattr(request, "request_id", None)), "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_teacher_verify(request, teacher_id: str):
+    from .services import review_verification
+    data = review_verification(request.user.id, request.user.roles, teacher_id, (request.data or {}).get("verification_id"), "APPROVED", (request.data or {}).get("reviewer_note"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_teacher_reject(request, teacher_id: str):
+    from .services import review_verification
+    data = review_verification(request.user.id, request.user.roles, teacher_id, (request.data or {}).get("verification_id"), "REJECTED", (request.data or {}).get("rejection_reason"), request_id=getattr(request, "request_id", None))
     return Response({"data": data, "request_id": getattr(request, "request_id", None)})

@@ -305,3 +305,44 @@ Real payment: forbidden
 Real payout: forbidden
 Production: forbidden
 ```
+
+## DEV Vertical Slice #7
+
+Implemented teacher verification on the existing approved baseline (no schema, state-machine, or architecture changes):
+
+```text
+Teacher submission (type + metadata + document metadata)
+→ SUBMITTED → Admin/OPS review (audited) → APPROVED / REJECTED
+→ trust-profile per-type booleans + public profile/search exposure
+```
+
+- Levels per PRD 9.2: IDENTITY approval → `IDENTITY_VERIFIED`; QUALIFICATION approval → `QUALIFICATION_REVIEWED` (Level 3 advanced verification = future, out of scope). EXPERIENCE/BACKGROUND_CHECK rows are tracked but have no profile-level mapping (no approved level exists).
+- Approved profile mapping with the no-demotion rule: a rejected lower type never demotes an approved higher level; profile → `REJECTED` only when no approved level remains.
+- Server-derived verification only: the API never accepts client-supplied status/verified flags. Automatic/AI/KYC/provider verification and real document storage are out of scope (DEV documents are metadata + synthetic storage key only).
+- Self-approval is forbidden; admin/OPS reads and decisions are audited (`ADMIN_ACTION` + `ADMIN_ACCESS` security events).
+
+VS7 endpoints:
+
+```text
+POST /api/v1/teachers/verifications                       # TEACHER (own), Idempotency-Key required
+GET  /api/v1/teachers/verifications                       # TEACHER (own)
+GET  /api/v1/admin/teachers/pending-verification          # OPS/ADMIN (audited)
+GET  /api/v1/admin/teachers/:id/verifications             # OPS/ADMIN (audited, metadata only)
+POST /api/v1/admin/teachers/:id/verify                    # OPS/ADMIN
+POST /api/v1/admin/teachers/:id/reject                    # OPS/ADMIN (reason required)
+```
+
+Current automated backend tests:
+
+```bash
+./scripts/run_backend_tests.sh
+# 118 passed (98 baseline regression + 20 VS7)
+```
+
+Strict boundaries (unchanged):
+
+```text
+Real payment: forbidden
+Real payout: forbidden
+Production: forbidden
+```

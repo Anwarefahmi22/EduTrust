@@ -309,6 +309,17 @@ def teacher_public_profile(teacher_id: str) -> dict:
         """,
         [teacher_id],
     )
+    # VS7 (V4): additive per-type verified booleans (approved API 8.5 / PRD 8.4
+    # shape). Existing fields preserved for backward compatibility.
+    approved_types = {
+        r["t"]
+        for r in fetchall(
+            "SELECT verification_type::text AS t FROM edutrust.teacher_verifications WHERE teacher_id=%s AND status='APPROVED'",
+            [teacher_id],
+        )
+    }
+    teacher["identity_verified"] = "IDENTITY" in approved_types
+    teacher["qualifications_verified"] = "QUALIFICATION" in approved_types
     return teacher
 
 
@@ -1755,3 +1766,306 @@ def list_admin_reviews(user_id: str, roles: list[str], request_id: str | None = 
         ORDER BY r.created_at DESC LIMIT 100
         """,
     )
+
+# ---- Vertical Slice 7 teacher verification services ----
+#
+# Baselines implemented here (no new business rules, no schema changes):
+# - PRD 9.2 (P0/P1): levels 0-2 (Level 3 future — out of scope); submit, admin
+#   review, status on profile, events logged; acceptance criteria: auditable
+#   approval/rejection, parents distinguish verified vs unverified, document
+#   access restricted.
+# - API Architecture 8.4: submission contract (type + documents + metadata;
+#   "API stores metadata and storage key only"; "Teacher cannot self-approve
+#   verification"); 8.1 (verification_status/listing_status not freely
+#   editable); 8.5 (per-type verified booleans); 21.1 admin endpoints.
+# - Security/Privacy Plan 6: document access only through audited admin/OPS
+#   flow; metadata-only in DEV (approved decision V6).
+# - Approved plan decisions: V1 profile mapping, V2 no-demotion, V3
+#   EXPERIENCE/BACKGROUND_CHECK rows without profile mapping, V4 additive
+#   trust-profile booleans, V5 mandatory Idempotency-Key, V6 metadata-only
+#   audited document access.
+# - Out of scope (no approved mechanic): EXPIRED, SUSPENDED, real document
+#   storage/upload, KYC/provider/AI/automatic verification, search filtering.
+
+VERIFICATION_TYPES = {"IDENTITY", "QUALIFICATION", "EXPERIENCE", "BACKGROUND_CHECK"}
+# V1/V2 profile-level mapping. Only IDENTITY/QUALIFICATION approvals carry an
+# approved profile level; EXPERIENCE/BACKGROUND_CHECK rows never change the
+# profile status (V3 — no approved level exists for them). SUSPENDED is never
+# touched by this slice (owned by the user-suspension workstream).
+_APPROVED_PROFILE_LEVELS = {"IDENTITY_VERIFIED", "QUALIFICATION_REVIEWED"}
+_LEVEL_RANK = {
+    "UNVERIFIED": 0,
+    "REJECTED": 0,
+    "SUBMITTED": 0,
+    "IDENTITY_VERIFIED": 1,
+    "QUALIFICATION_REVIEWED": 2,
+    "SUSPENDED": 9,
+}
+
+
+def _verification_approved_levels(teacher_profile_id: str) -> set:
+    """Types currently at APPROVED for the teacher (per-type results)."""
+    rows = fetchall(
+        "SELECT verification_type::text FROM edutrust.teacher_verifications WHERE teacher_id=%s AND status='APPROVED'",
+        [teacher_profile_id],
+    )
+    return {r["verification_type"] for r in rows}
+
+
+def _highest_profile_level(approved_types: set) -> str | None:
+    if "QUALIFICATION" in approved_types:
+        return "QUALIFICATION_REVIEWED"
+    if "IDENTITY" in approved_types:
+        return "IDENTITY_VERIFIED"
+    return None
+
+
+def _apply_profile_status_after_change(teacher_profile_id: str, changed_type: str, decision: str | None):
+    """Approved profile-status mapping (V1) with the no-demotion rule (V2).
+
+    - submission: UNVERIFIED/REJECTED -> SUBMITTED; never demotes SUBMITTED or
+      an approved level.
+    - APPROVED: profile rises to the highest approved level; an already
+      approved level is never demoted by approving a lower type.
+    - REJECTED: profile -> REJECTED only when no approved level remains (V1);
+      an approved level is never demoted by rejecting a lower type (V2).
+    """
+    current = fetchone("SELECT verification_status::text FROM edutrust.teacher_profiles WHERE id=%s", [teacher_profile_id])
+    current_status = current["verification_status"]
+    if current_status == "SUSPENDED":
+        return
+
+    def set_status(status: str):
+        execute(
+            "UPDATE edutrust.teacher_profiles SET verification_status=%s::edutrust.teacher_verification_status, updated_at=now() WHERE id=%s",
+            [status, teacher_profile_id],
+        )
+
+    if decision is None:  # submission (any type)
+        if current_status in ("UNVERIFIED", "REJECTED"):
+            set_status("SUBMITTED")
+        return
+
+    approved = _verification_approved_levels(teacher_profile_id)
+    if decision == "APPROVED":
+        approved.add(changed_type)
+    # (REJECTED rows were SUBMITTED, so the approved set is unchanged.)
+    target = _highest_profile_level(approved)
+    if decision == "APPROVED":
+        if target is None:  # EXPERIENCE/BACKGROUND_CHECK: no profile level (V3)
+            return
+        if current_status in _APPROVED_PROFILE_LEVELS and _LEVEL_RANK[current_status] > _LEVEL_RANK[target]:
+            return  # V2: never demote an approved higher level
+        set_status(target)
+    else:  # REJECTED
+        if target is not None:
+            return  # an approved level remains; profile already reflects it (V2)
+        if current_status in _APPROVED_PROFILE_LEVELS:
+            return  # defensive: never demote an approved level
+        set_status("REJECTED")
+
+
+def submit_verification(teacher_user_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    vtype = str(data.get("verification_type") or "").upper()
+    if vtype not in VERIFICATION_TYPES:
+        raise ApiError("VALIDATION_ERROR", f"verification_type must be one of {sorted(VERIFICATION_TYPES)}.", 400)
+    documents = data.get("documents")
+    doc_rows = []
+    if documents is not None:
+        if not isinstance(documents, list):
+            raise ApiError("VALIDATION_ERROR", "documents must be a list.", 400)
+        for d in documents:
+            if not isinstance(d, dict):
+                raise ApiError("VALIDATION_ERROR", "each document must be an object.", 400)
+            dtype = str(d.get("document_type") or "").strip()
+            token = str(d.get("upload_token") or "").strip()
+            if not dtype or not token:
+                raise ApiError("VALIDATION_ERROR", "document_type and upload_token are required for each document.", 400)
+            doc_rows.append((dtype, token))
+    metadata = data.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ApiError("VALIDATION_ERROR", "metadata must be an object.", 400)
+    teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE user_id=%s", [teacher_user_id])
+    if not teacher:
+        raise ApiError("FORBIDDEN", "Teacher profile is required.", 403)
+    canonical = {"verification_type": vtype,
+                 "documents": [{"document_type": d[0], "upload_token": d[1]} for d in doc_rows],
+                 "metadata": metadata}
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, default=str).encode()).hexdigest()
+    with tx():
+        replay = _idempotency_begin("verification_submit", teacher_user_id, idempotency_key, request_hash, "/api/v1/teachers/verifications")
+        if replay:
+            return replay["response_body"]
+        verification = fetchone(
+            """
+            INSERT INTO edutrust.teacher_verifications (teacher_id, verification_type, status, metadata)
+            VALUES (%s, %s::edutrust.verification_type, 'SUBMITTED', %s::jsonb)
+            RETURNING id::text, teacher_id::text, verification_type::text, status::text, submitted_at,
+                      reviewed_by_user_id::text, reviewed_at, reviewer_note, rejection_reason, metadata
+            """,
+            [teacher["id"], vtype, json.dumps(metadata or {}, default=str)],
+        )
+        for dtype, token in doc_rows:
+            # DEV: metadata + synthetic storage key only (API 8.4; V6). No real storage.
+            fetchone(
+                """
+                INSERT INTO edutrust.verification_documents (verification_id, teacher_id, uploaded_by_user_id, document_type, storage_key, file_mime_type, status)
+                VALUES (%s, %s, %s, %s, %s, 'application/octet-stream', 'UPLOADED')
+                RETURNING id::text, verification_id::text, teacher_id::text, document_type, storage_key, status::text
+                """,
+                [verification["id"], teacher["id"], teacher_user_id, dtype, f"dev-synthetic-{uuid.uuid4().hex}"],
+            )
+        _apply_profile_status_after_change(teacher["id"], vtype, None)
+        write_event(
+            "TEACHER_VERIFICATION_SUBMITTED", "teacher_verification", verification["id"],
+            actor_user_id=teacher_user_id, actor_role="TEACHER", request_id=request_id,
+            metadata={"verification_type": vtype, "document_count": len(doc_rows)},
+        )
+        verification["documents"] = _serialize_row_rows(verification_documents(verification["id"]))
+        response = {"verification": _serialize_row(_decode_metadata(verification)),
+                    "profile_verification_status": fetchone("SELECT verification_status::text FROM edutrust.teacher_profiles WHERE id=%s", [teacher["id"]])["verification_status"]}
+        _idempotency_complete("verification_submit", teacher_user_id, idempotency_key, 201, response, "teacher_verification", verification["id"])
+    return response
+
+
+def verification_documents(verification_id: str) -> list[dict]:
+    return fetchall(
+        """
+        SELECT id::text, verification_id::text, teacher_id::text, document_type, storage_key, sha256_hash,
+               file_mime_type, file_size_bytes, encrypted, status::text, created_at
+        FROM edutrust.verification_documents WHERE verification_id=%s ORDER BY created_at, id
+        """,
+        [verification_id],
+    )
+
+
+def _decode_metadata(row: dict) -> dict:
+    import json
+    m = row.get("metadata")
+    if isinstance(m, str):
+        try:
+            row["metadata"] = json.loads(m)
+        except (TypeError, ValueError):
+            pass
+    return row
+
+
+def _verification_with_documents(verification_id: str) -> dict:
+    row = fetchone(
+        """
+        SELECT id::text, teacher_id::text, verification_type::text, status::text, submitted_at,
+               reviewed_by_user_id::text, reviewed_at, reviewer_note, rejection_reason, metadata
+        FROM edutrust.teacher_verifications WHERE id=%s
+        """,
+        [verification_id],
+    )
+    if not row:
+        raise ApiError("RESOURCE_NOT_FOUND", "Verification not found.", 404)
+    row["documents"] = verification_documents(verification_id)
+    return _serialize_row(_decode_metadata(row))
+
+
+def list_verifications_for_teacher(teacher_user_id: str) -> dict:
+    teacher = fetchone("SELECT id::text, verification_status::text FROM edutrust.teacher_profiles WHERE user_id=%s", [teacher_user_id])
+    if not teacher:
+        raise ApiError("FORBIDDEN", "Teacher profile is required.", 403)
+    rows = fetchall(
+        """
+        SELECT id::text, verification_type::text, status::text, submitted_at, reviewed_at, reviewer_note, rejection_reason, metadata
+        FROM edutrust.teacher_verifications WHERE teacher_id=%s ORDER BY submitted_at DESC, id DESC LIMIT 100
+        """,
+        [teacher["id"]],
+    )
+    return {"profile_verification_status": teacher["verification_status"],
+            "verifications": [_serialize_row(_decode_metadata(r)) for r in rows]}
+
+
+def list_pending_verifications(user_id: str, roles: list[str], request_id: str | None = None) -> dict:
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    write_event("ADMIN_ACTION", "teacher_verifications", None, actor_user_id=user_id, actor_role=actor_role, request_id=request_id, metadata={"action": "READ_PENDING_VERIFICATIONS"})
+    write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "teacher_verifications", "request_id": request_id})
+    teachers = fetchall(
+        """
+        SELECT tp.id::text, tp.public_name, tp.verification_status::text,
+               (SELECT count(*)::int FROM edutrust.teacher_verifications tv WHERE tv.teacher_id=tp.id AND tv.status='SUBMITTED') AS pending_count
+        FROM edutrust.teacher_profiles tp
+        WHERE EXISTS (SELECT 1 FROM edutrust.teacher_verifications tv WHERE tv.teacher_id=tp.id AND tv.status='SUBMITTED')
+        ORDER BY tp.created_at DESC LIMIT 100
+        """,
+    )
+    for t in teachers:
+        t["pending"] = fetchall(
+            "SELECT id::text, verification_type::text, submitted_at FROM edutrust.teacher_verifications WHERE teacher_id=%s AND status='SUBMITTED' ORDER BY submitted_at",
+            [t["id"]],
+        )
+        t["pending"] = _serialize_row_rows(t["pending"])
+    return {"teachers": _serialize_row_rows(teachers)}
+
+
+def get_verifications_for_admin(user_id: str, roles: list[str], teacher_id: str, request_id: str | None = None) -> dict:
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    write_event("ADMIN_ACTION", "teacher_verification", None, actor_user_id=user_id, actor_role=actor_role, request_id=request_id, metadata={"action": "READ_VERIFICATION_DETAIL", "teacher_id": teacher_id})
+    write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "teacher_verification", "teacher_id": teacher_id, "request_id": request_id})
+    teacher = fetchone(
+        "SELECT id::text, public_name, verification_status::text, listing_status::text, experience_years, languages, base_wilaya_code FROM edutrust.teacher_profiles WHERE id=%s",
+        [teacher_id],
+    )
+    if not teacher:
+        raise ApiError("RESOURCE_NOT_FOUND", "Teacher not found.", 404)
+    rows = fetchall(
+        """
+        SELECT id::text, verification_type::text, status::text, submitted_at, reviewed_at, reviewer_note, rejection_reason, metadata
+        FROM edutrust.teacher_verifications WHERE teacher_id=%s ORDER BY submitted_at DESC, id DESC LIMIT 100
+        """,
+        [teacher_id],
+    )
+    verifications = []
+    for r in rows:
+        rr = _serialize_row(_decode_metadata(r))
+        rr["documents"] = _serialize_row_rows(verification_documents(r["id"]))
+        verifications.append(rr)
+    return {"teacher": _serialize_row(teacher), "verifications": verifications}
+
+
+def review_verification(user_id: str, roles: list[str], teacher_id: str, verification_id: str, decision: str, reason: str | None, request_id: str | None = None) -> dict:
+    """Shared core for E5 verify (APPROVED) and E6 reject (REJECTED).
+    decision: 'APPROVED' | 'REJECTED'. reason: reviewer_note (APPROVED) or
+    rejection_reason (REJECTED, required non-empty)."""
+    if decision not in ("APPROVED", "REJECTED"):
+        raise ApiError("VALIDATION_ERROR", "decision must be APPROVED or REJECTED.", 400)
+    if decision == "REJECTED" and not (reason and reason.strip()):
+        raise ApiError("VALIDATION_ERROR", "rejection_reason is required.", 400)
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    with tx():
+        teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE id=%s FOR UPDATE", [teacher_id])
+        if not teacher:
+            raise ApiError("RESOURCE_NOT_FOUND", "Teacher not found.", 404)
+        row = fetchone(
+            "SELECT id::text, teacher_id::text, verification_type::text, status::text FROM edutrust.teacher_verifications WHERE id=%s AND teacher_id=%s FOR UPDATE",
+            [verification_id, teacher_id],
+        )
+        if not row:
+            raise ApiError("RESOURCE_NOT_FOUND", "Verification not found for this teacher.", 404)
+        if row["status"] != "SUBMITTED":
+            raise ApiError("INVALID_STATE_TRANSITION", f"Verification cannot be reviewed from status {row['status']}.", 422, {"current_status": row["status"]})
+        note = reason.strip() if reason and reason.strip() else None
+        if decision == "APPROVED":
+            execute(
+                "UPDATE edutrust.teacher_verifications SET status='APPROVED'::edutrust.verification_review_status, reviewed_by_user_id=%s, reviewed_at=now(), reviewer_note=%s WHERE id=%s",
+                [user_id, note, verification_id],
+            )
+        else:
+            execute(
+                "UPDATE edutrust.teacher_verifications SET status='REJECTED'::edutrust.verification_review_status, reviewed_by_user_id=%s, reviewed_at=now(), rejection_reason=%s WHERE id=%s",
+                [user_id, reason.strip(), verification_id],
+            )
+        _apply_profile_status_after_change(teacher_id, row["verification_type"], decision)
+        event = "TEACHER_VERIFIED" if decision == "APPROVED" else "TEACHER_REJECTED"
+        write_event(event, "teacher_verification", verification_id, actor_user_id=user_id, actor_role=actor_role, request_id=request_id,
+                    metadata={"verification_type": row["verification_type"], "reviewer_note": note, "rejection_reason": reason.strip() if decision == "REJECTED" else None})
+        write_event("ADMIN_ACTION", "teacher_verification", verification_id, actor_user_id=user_id, actor_role=actor_role, request_id=request_id,
+                    metadata={"action": "VERIFICATION_APPROVED" if decision == "APPROVED" else "VERIFICATION_REJECTED", "verification_type": row["verification_type"]})
+    result = _verification_with_documents(verification_id)
+    status = fetchone("SELECT verification_status::text FROM edutrust.teacher_profiles WHERE id=%s", [teacher_id])["verification_status"]
+    return {"verification": result, "profile_verification_status": status}

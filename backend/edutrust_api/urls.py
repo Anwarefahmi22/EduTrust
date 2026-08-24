@@ -52,4 +52,11 @@ urlpatterns = [
     # Vertical Slice 6: review moderation
     path("admin/reviews/<uuid:review_id>/moderate", views.admin_reviews_moderate),
     path("admin/reviews", views.admin_reviews),
+
+    # Vertical Slice 7: teacher verification
+    path("teachers/verifications", views.teacher_verifications),
+    path("admin/teachers/pending-verification", views.admin_teachers_pending_verification),
+    path("admin/teachers/<uuid:teacher_id>/verifications", views.admin_teacher_verifications),
+    path("admin/teachers/<uuid:teacher_id>/verify", views.admin_teacher_verify),
+    path("admin/teachers/<uuid:teacher_id>/reject", views.admin_teacher_reject),
 ]

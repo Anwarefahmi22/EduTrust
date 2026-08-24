@@ -18,6 +18,10 @@ export default function AdminDashboardShell() {
   const [modAction, setModAction] = useState('')
   const [modReason, setModReason] = useState('')
   const [modResult, setModResult] = useState('')
+  const [pendingTeachers, setPendingTeachers] = useState<any[]>([])
+  const [verifDetail, setVerifDetail] = useState<any | null>(null)
+  const [verifNote, setVerifNote] = useState('')
+  const [verifResult, setVerifResult] = useState('')
   const addLog = (m: string) => setLog((l) => [m, ...l].slice(0, 12))
   async function loginOnly() { const res:any=await apiPost('/api/v1/auth/login',{identifier:email,password}); setToken(res.data.access_token); addLog('Admin logged in') }
   async function securityEvents() { const res:any=await apiGet('/api/v1/admin/security-events',token); addLog(`Security events ${res.data.count}`) }
@@ -66,6 +70,29 @@ export default function AdminDashboardShell() {
     } catch (e: any) { setModResult(`Moderation rejected: ${e.message}`); addLog(`Moderation rejected: ${e.message}`) }
   }
 
+  async function loadPending() {
+    const res: any = await apiGet('/api/v1/admin/teachers/pending-verification', token)
+    setPendingTeachers(res.data.teachers || [])
+    addLog(`Pending verifications: ${(res.data.teachers || []).length} teachers — access audited`)
+  }
+  async function loadVerifDetail(teacherId: string) {
+    const res: any = await apiGet(`/api/v1/admin/teachers/${teacherId}/verifications`, token)
+    setVerifDetail(res.data)
+    addLog(`Verification detail loaded for ${res.data.teacher.public_name} — access audited`)
+  }
+  async function reviewVerif(action: string) {
+    if (!verifDetail) return
+    const v = (verifDetail.verifications || []).find((x: any) => x.status === 'SUBMITTED')
+    if (!v) { setVerifResult('No SUBMITTED verification in this detail view'); return }
+    const body: any = action === 'verify' ? { verification_id: v.id, reviewer_note: verifNote } : { verification_id: v.id, rejection_reason: verifNote }
+    try {
+      const res: any = await apiPost(`/api/v1/admin/teachers/${verifDetail.teacher.id}/${action}`, body, token)
+      setVerifResult(`${action === 'verify' ? 'Approved' : 'Rejected'} → profile ${res.data.profile_verification_status}`)
+      addLog(`Verification ${action}: ${v.id} (${v.verification_type}) — audited`)
+      loadVerifDetail(verifDetail.teacher.id)
+    } catch (e: any) { setVerifResult(`Review failed: ${e.message}`); addLog(`Review failed: ${e.message}`) }
+  }
+
   return <>
     <section className="card"><span className="badge warning">Admin / OPS shell</span><h1>Admin Dashboard</h1><p className="muted">Admin users are seeded/created outside public registration. Sensitive access is logged.</p></section>
     <section className="grid"><div className="card"><h2>Login</h2><input value={email} onChange={e=>setEmail(e.target.value)} style={{width:'100%',padding:8}}/><br/><br/><button className="primary" onClick={loginOnly}>Login existing admin</button></div><div className="card"><h2>Audit</h2><button className="primary" onClick={securityEvents} disabled={!token}>Read security events</button> <button onClick={payments} disabled={!token}>Payments</button> <button onClick={events} disabled={!token}>Event ledger</button> <button onClick={sessions} disabled={!token}>Sessions</button><p className="muted">This access will be logged.</p></div></section>
@@ -107,6 +134,23 @@ export default function AdminDashboardShell() {
       <input placeholder="moderation reason (required)" value={modReason} onChange={e=>setModReason(e.target.value)} style={{width:'100%',padding:8}}/>
       {modResult && <p className="muted">{modResult}</p>}
       <p className="muted">REMOVE is ADMIN-only. Moderation is audited (ADMIN_ACTION + security events). Reviews are never physically deleted; public visibility follows the VISIBLE+verified filter.</p>
+    </section>
+    <section className="card"><span className="badge warning">VS7 — Verification Queue</span><h2>Teacher Verification (operational)</h2>
+      <button className="primary" onClick={loadPending} disabled={!token}>Load pending</button>
+      <ul>{pendingTeachers.map(t => <li key={t.id}>{t.public_name} · profile {t.verification_status} — {t.pending.map((p: any) => p.verification_type).join(', ')} — <a href="#" onClick={(e) => { e.preventDefault(); loadVerifDetail(t.id) }}>review</a></li>)}</ul>
+      {verifDetail && <div>
+        <h3>{verifDetail.teacher.public_name} — {verifDetail.teacher.verification_status}</h3>
+        <ul>{(verifDetail.verifications || []).map((v: any) => <li key={v.id}>{v.verification_type} · <b>{v.status}</b> · submitted {String(v.submitted_at).slice(0,10)}
+          {(v.documents || []).map((d: any) => <span key={d.id}> [doc: {d.document_type} ({d.status})]</span>)}
+          {v.metadata && Object.keys(v.metadata).length > 0 ? ` · ${JSON.stringify(v.metadata)}` : ''}
+          {v.reviewer_note ? ` · note: ${v.reviewer_note}` : ''}
+          {v.rejection_reason ? ` · rejected: ${v.rejection_reason}` : ''}</li>)}</ul>
+        <input placeholder="reviewer note (verify) / rejection reason (reject)" value={verifNote} onChange={e=>setVerifNote(e.target.value)} style={{width:'100%',padding:8}}/>
+        <br/><br/>
+        <button onClick={()=>reviewVerif('verify')}>Approve</button> <button onClick={()=>reviewVerif('reject')}>Reject</button>
+        {verifResult && <p className="muted">{verifResult}</p>}
+      </div>}
+      <p className="muted">Documents are metadata-only in DEV (no real storage). All actions are logged (ADMIN_ACTION + security events).</p>
     </section>
     <section className="card"><h2>Activity</h2>{log.map((l,i)=><p key={i}>{l}</p>)}</section>
   </>
