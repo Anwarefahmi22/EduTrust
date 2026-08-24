@@ -1,0 +1,38 @@
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path("auth/register", views.register),
+    path("auth/login", views.login_view),
+    path("auth/logout", views.logout_view),
+    path("students", views.students_create),
+    path("students/<uuid:student_id>", views.students_detail),
+    path("teachers/me", views.teachers_me),
+    path("teachers/subjects", views.teacher_subjects),
+    path("teachers/availability/slots", views.teacher_availability_slots),
+    path("teachers/availability/slots/<uuid:slot_id>/block", views.teacher_availability_block),
+    path("teachers/availability/slots/<uuid:slot_id>/unblock", views.teacher_availability_unblock),
+    path("teachers/search", views.teachers_search),
+    path("teachers/match", views.teachers_match),
+    path("teachers/<uuid:teacher_id>", views.teacher_profile),
+    path("teachers/<uuid:teacher_id>/trust-profile", views.teacher_trust_profile),
+    path("bookings/hold", views.bookings_hold),
+    path("bookings/<uuid:booking_id>/confirm", views.bookings_confirm),
+    path("bookings", views.bookings_list),
+    path("bookings/<uuid:booking_id>", views.bookings_detail),
+
+    path("payments/initiate", views.payments_initiate),
+    path("payments/<uuid:payment_id>", views.payments_detail),
+    path("payments/<uuid:payment_id>/mock/succeed", views.payments_mock_succeed),
+    path("payments/<uuid:payment_id>/mock/fail", views.payments_mock_fail),
+
+    path("sessions", views.sessions_list),
+    path("sessions/<uuid:session_id>", views.sessions_detail),
+    path("sessions/<uuid:session_id>/start", views.sessions_start),
+    path("sessions/<uuid:session_id>/complete", views.sessions_complete),
+    path("sessions/<uuid:session_id>/no-show", views.sessions_no_show),
+    path("sessions/<uuid:session_id>/report", views.sessions_report),
+    path("admin/payments", views.admin_payments),
+    path("admin/events", views.admin_events),
+    path("admin/security-events", views.admin_security_events),
+]

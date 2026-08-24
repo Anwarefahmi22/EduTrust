@@ -1,0 +1,3539 @@
+# EduTrust Algeria — API Architecture v1.0
+
+**Product:** EduTrust Algeria  
+**MVP:** v0.1  
+**Document:** API Architecture v1.0  
+**Depends on:**
+1. EduTrust MVP PRD v1.0
+2. EduTrust PostgreSQL Database Schema v1.0
+
+**Architecture decision:** Modular Monolith + PostgreSQL.  
+**Database status:** Approved baseline with conditions.  
+**Important:** This document does not redesign the database, does not introduce microservices, and does not expand the MVP scope.
+
+---
+
+# 1. Executive Summary
+
+EduTrust API v1.0 translates the approved PostgreSQL schema into an implementable API contract for the MVP transaction loop:
+
+```text
+Parent
+   ↓
+Student Profile
+   ↓
+Search / Match
+   ↓
+Teacher Trust Profile
+   ↓
+Available Slot
+   ↓
+Booking
+   ↓
+Payment
+   ↓
+Session
+   ↓
+Session Report
+   ↓
+Verified Review
+   ↓
+Repeat Booking
+```
+
+The API must protect the product’s core invariants:
+
+- No parent may access another parent’s student data.
+- Teacher Trust Metrics are derived and never teacher-editable.
+- Student Passport data comes from structured session/report/progress events, not AI.
+- Booking, Payment, and Session state machines remain separate.
+- State transitions happen only through authorized endpoints.
+- Payment webhooks are transaction boundaries with strict idempotency.
+- Financial ledger entries are internal, immutable, and reversal-based.
+- Every critical business operation writes an Event Ledger entry.
+- API logic must not rely on frontend validation for security or consistency.
+
+---
+
+# 2. API Principles
+
+## 2.1 API style
+
+EduTrust MVP uses a pragmatic REST-style JSON API.
+
+```text
+Base URL: /api/v1
+Content-Type: application/json
+Auth: Bearer access token
+```
+
+No GraphQL, no public event bus, no microservices, no unnecessary infrastructure for MVP.
+
+## 2.2 Versioning
+
+```text
+/api/v1/...
+```
+
+Breaking changes create `/api/v2`. Non-breaking additions remain in v1.
+
+## 2.3 Authentication model
+
+- Short-lived access tokens.
+- Rotating refresh tokens.
+- Refresh token hashes stored in `auth_sessions`.
+- Raw refresh tokens are never stored.
+- Logout revokes current refresh token.
+- Revoke-sessions revokes all or selected sessions.
+
+## 2.4 Authorization model
+
+Authorization uses:
+
+1. RBAC role checks.
+2. Object ownership checks.
+3. State-transition authority checks.
+4. Sensitive-data scopes.
+5. Admin override controls with audit events.
+
+Roles:
+
+```text
+PARENT
+TEACHER
+SUPPORT
+OPS
+ADMIN
+```
+
+## 2.5 Request ID / correlation ID
+
+Every request must have a request ID.
+
+Header accepted:
+
+```text
+X-Request-ID: UUID
+```
+
+If absent, API generates one. The request ID must be included in:
+
+- Error responses
+- Application logs
+- Event Ledger metadata
+- Payment initiation logs
+- Webhook processing logs
+
+## 2.6 Idempotency
+
+State-changing POST endpoints that can be retried must use:
+
+```text
+Idempotency-Key: <client-generated-key>
+```
+
+Required at minimum for:
+
+- `POST /bookings/hold`
+- `POST /payments/initiate`
+- `POST /payments/webhooks/:provider`
+- `POST /payments/:id/refund`
+- `POST /admin/payouts/process`
+
+**Schema note:** The approved schema contains `payments.idempotency_key` and `event_ledger.idempotency_key`, but does not include a general API idempotency table for non-payment endpoints. This is listed under **Schema/API Conflicts Requiring Decision**.
+
+## 2.7 Pagination
+
+List endpoints use cursor pagination by default.
+
+Request:
+
+```text
+GET /bookings?limit=20&cursor=eyJpZCI6...
+```
+
+Response:
+
+```json
+{
+  "data": [],
+  "pagination": {
+    "limit": 20,
+    "next_cursor": "eyJpZCI6...",
+    "has_more": true
+  }
+}
+```
+
+Default limit: `20`  
+Maximum limit: `100`
+
+## 2.8 Filtering and sorting
+
+Filtering is explicit per endpoint.
+
+Examples:
+
+```text
+GET /bookings?status=BOOKED&from=2026-09-01T00:00:00Z
+GET /teachers/search?subject_id=...&academic_level_id=...&mode=ONLINE
+```
+
+Sorting uses allowlisted fields only.
+
+Example:
+
+```text
+sort=scheduled_start:asc
+sort=price_amount:asc
+```
+
+Never allow arbitrary SQL field sorting from client input.
+
+## 2.9 Validation
+
+Validation happens in three layers:
+
+1. API request validation.
+2. Service/business rule validation.
+3. PostgreSQL constraints/triggers as final guard.
+
+Do not rely only on frontend validation.
+
+## 2.10 Money representation
+
+Money must not be represented as floating-point numbers in API clients.
+
+Recommended API representation:
+
+```json
+{
+  "amount": "2000.00",
+  "currency": "DZD"
+}
+```
+
+Backend stores as PostgreSQL `NUMERIC(12,2)`.
+
+## 2.11 Timestamp behavior
+
+- Persist all absolute timestamps in UTC.
+- API responses return ISO 8601 UTC timestamps.
+- Requests involving local availability must include timezone.
+- MVP default timezone: `Africa/Algiers`.
+- UI converts UTC to local display time.
+
+Example:
+
+```json
+{
+  "starts_at": "2026-09-05T13:00:00Z",
+  "timezone": "Africa/Algiers",
+  "local_display": "2026-09-05 14:00"
+}
+```
+
+`local_display` may be generated by frontend; it is not required as stored data.
+
+## 2.12 Transaction boundaries
+
+Financial and state-changing endpoints must specify:
+
+```text
+BEGIN
+  validate actor
+  lock relevant rows
+  perform business updates
+  insert event_ledger
+COMMIT
+```
+
+External provider calls must happen outside database transactions. Never hold a PostgreSQL transaction open while waiting for a payment provider.
+
+---
+
+# 3. Authentication
+
+## 3.1 Token model
+
+### Access token
+
+- Short-lived, e.g. 10–15 minutes.
+- Contains user ID, roles, session ID, issued-at, expiry.
+- Used for API authorization.
+
+### Refresh token
+
+- Longer-lived, e.g. 14–30 days depending on risk policy.
+- Rotated on every refresh.
+- Stored only as a hash in `auth_sessions.refresh_token_hash`.
+- Revocable.
+
+## 3.2 Endpoints
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/auth/register` | Public | Create user + initial role | `USER_REGISTERED` |
+| POST | `/auth/login` | Public | Login and create auth session | `USER_LOGIN` or `SECURITY_EVENT` |
+| POST | `/auth/refresh` | Auth via refresh token | Rotate refresh token | Security event on anomaly |
+| POST | `/auth/logout` | Authenticated | Revoke current session | `SECURITY_EVENT` |
+| POST | `/auth/revoke-sessions` | Authenticated | Revoke all/selected sessions | `SECURITY_EVENT` |
+
+## 3.3 Register
+
+```text
+POST /api/v1/auth/register
+```
+
+Allowed roles at public registration:
+
+```text
+PARENT
+TEACHER
+```
+
+Admin/OPS/SUPPORT accounts must be created through admin-controlled internal process, not public registration.
+
+Validation:
+
+- `full_name` required.
+- Either phone or email required.
+- Password or approved passwordless flow required.
+- Role must be `PARENT` or `TEACHER`.
+- Phone/email unique.
+
+Transaction boundary:
+
+```text
+BEGIN
+  insert users
+  insert user_roles
+  insert parent_profiles or initial teacher_profiles when appropriate
+  insert event_ledger USER_REGISTERED
+COMMIT
+```
+
+## 3.4 Login
+
+```text
+POST /api/v1/auth/login
+```
+
+Behavior:
+
+- Verify credentials.
+- If failed, write `security_events.LOGIN_FAILED`.
+- Rate limit by IP + identifier.
+- On success, create `auth_sessions` with hashed refresh token.
+- Return access token and raw refresh token once.
+
+## 3.5 Refresh
+
+```text
+POST /api/v1/auth/refresh
+```
+
+Behavior:
+
+- Verify refresh token hash against active `auth_sessions` row.
+- Rotate token.
+- Store new hash.
+- Revoke old token in the same transaction.
+- If replay of old token is detected, revoke session family where supported and log `SECURITY_EVENT`.
+
+## 3.6 Logout
+
+```text
+POST /api/v1/auth/logout
+```
+
+Revokes current auth session.
+
+## 3.7 Revoke sessions
+
+```text
+POST /api/v1/auth/revoke-sessions
+```
+
+Allows user to revoke:
+
+- Current session
+- All other sessions
+- All sessions
+
+---
+
+# 4. Authorization / RBAC
+
+## 4.1 Roles
+
+### PARENT
+
+Can:
+
+- Manage own parent profile.
+- Create and manage own student profiles.
+- Search/match teachers.
+- Book for own students only.
+- Initiate payments for own bookings.
+- View own payments, bookings, sessions, reports.
+- Create reviews only after verified completed sessions.
+- Open disputes for own bookings/sessions/payments.
+
+Cannot:
+
+- Access another parent’s student.
+- Edit teacher trust metrics.
+- Mark session completed.
+- Access raw payment provider payload.
+- Access verification documents.
+- Access global event ledger.
+
+### TEACHER
+
+Can:
+
+- Manage own teacher profile.
+- Submit verification.
+- Manage own subjects and availability.
+- View own bookings/sessions.
+- Start and complete own sessions.
+- Submit reports for own completed sessions.
+- View own reviews and payout records.
+
+Cannot:
+
+- Access unrelated student data.
+- Review themselves.
+- Edit trust metrics.
+- Confirm payments.
+- Process payouts.
+- Access raw provider payload.
+- Resolve disputes.
+
+### SUPPORT
+
+Can:
+
+- View limited user, booking, and dispute context for support.
+- Cannot access raw payment payload by default.
+- Cannot approve verification unless explicitly elevated.
+- Cannot process refunds/payouts.
+
+### OPS
+
+Can:
+
+- Monitor bookings/payments.
+- Handle operational exceptions.
+- Manage disputes except high-risk financial/safety actions requiring admin.
+- Perform manual booking confirmation only for approved pilot payment workflows.
+- View event ledger for operational scope.
+
+### ADMIN
+
+Can:
+
+- Verify teachers.
+- Suspend users.
+- Moderate reviews.
+- Resolve disputes.
+- Approve refunds/payouts.
+- Access event ledger.
+- Access verification documents through audited secure access.
+- Perform admin overrides.
+
+Every admin/ops/support sensitive action writes `ADMIN_ACTION` or `SECURITY_EVENT`.
+
+## 4.2 Object ownership rules
+
+Object ownership is mandatory.
+
+Examples:
+
+```text
+Parent can access student only if student.parent_id = parent_profiles.id.
+Teacher can access session only if session.teacher_id = teacher_profiles.id.
+Parent can access booking only if booking.parent_id = parent_profiles.id.
+```
+
+## 4.3 Sensitive student data access
+
+Teachers see only necessary session context:
+
+- Student display name/nickname
+- Academic level
+- Subject and learning goal
+- Relevant report context if parent permission exists
+
+Teachers do not receive unnecessary minor data.
+
+## 4.4 Verification document access
+
+Verification documents are never directly returned in public APIs.
+
+Admin access uses:
+
+- Audited request
+- Short-lived signed URL or secure proxy
+- `security_events.DOCUMENT_ACCESS`
+- `event_ledger.ADMIN_ACTION`
+
+---
+
+# 5. API Conventions
+
+## 5.1 Standard headers
+
+```text
+Authorization: Bearer <access_token>
+Content-Type: application/json
+X-Request-ID: <uuid>
+Idempotency-Key: <key>   // required for selected POST endpoints
+```
+
+## 5.2 Standard success envelope
+
+Single resource:
+
+```json
+{
+  "data": {
+    "id": "..."
+  },
+  "request_id": "..."
+}
+```
+
+List:
+
+```json
+{
+  "data": [],
+  "pagination": {
+    "limit": 20,
+    "next_cursor": null,
+    "has_more": false
+  },
+  "request_id": "..."
+}
+```
+
+## 5.3 Standard error format
+
+```json
+{
+  "error": {
+    "code": "BOOKING_SLOT_UNAVAILABLE",
+    "message": "The selected slot is no longer available.",
+    "request_id": "6f32c34f-3a9a-4c4a-92c0-0bb5cdb2f981",
+    "details": {}
+  }
+}
+```
+
+## 5.4 Error categories
+
+| HTTP | Category | Example code |
+|---:|---|---|
+| 400 | Validation | `VALIDATION_ERROR` |
+| 401 | Authentication | `AUTH_REQUIRED`, `TOKEN_EXPIRED` |
+| 403 | Authorization | `FORBIDDEN`, `STUDENT_ACCESS_DENIED` |
+| 404 | Not found | `RESOURCE_NOT_FOUND` |
+| 409 | Conflict | `BOOKING_SLOT_UNAVAILABLE`, `DUPLICATE_REVIEW` |
+| 422 | Business rule | `INVALID_STATE_TRANSITION`, `PAYMENT_AMOUNT_MISMATCH` |
+| 429 | Rate limit | `RATE_LIMITED` |
+| 500 | Internal | `INTERNAL_ERROR` |
+| 502/503 | Provider | `PAYMENT_PROVIDER_UNAVAILABLE` |
+
+Do not leak sensitive details in error messages.
+
+---
+
+# 6. Parent APIs
+
+## 6.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| GET | `/parents/me` | PARENT | Get own profile | None |
+| PATCH | `/parents/me` | PARENT | Update own profile | `ADMIN_ACTION` only if admin; otherwise optional profile event |
+| GET | `/parents/me/dashboard` | PARENT | Parent dashboard summary | None |
+
+## 6.2 `GET /parents/me`
+
+Returns current parent profile.
+
+Authorization:
+
+- Role `PARENT`.
+- User must own the parent profile.
+
+Response:
+
+```json
+{
+  "data": {
+    "id": "parent_7d8c...",
+    "user_id": "user_1a2b...",
+    "full_name": "Ahmed Benali",
+    "preferred_language": "ar",
+    "created_at": "2026-09-01T10:00:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+## 6.3 `PATCH /parents/me`
+
+Allows parent to update non-sensitive profile fields.
+
+Request:
+
+```json
+{
+  "preferred_language": "fr"
+}
+```
+
+Validation:
+
+- Language must be allowlisted.
+
+---
+
+# 7. Student APIs
+
+## 7.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/students` | PARENT | Create student profile | `STUDENT_PROFILE_CREATED` |
+| GET | `/students` | PARENT | List own students | None |
+| GET | `/students/:id` | PARENT | Get own student | None |
+| PATCH | `/students/:id` | PARENT | Update own student | `STUDENT_PROFILE_UPDATED` |
+| DELETE | `/students/:id` | PARENT | Archive/delete own student | `STUDENT_PROFILE_UPDATED` |
+| GET | `/students/:id/passport` | PARENT | View Student Passport v0 | None |
+| POST | `/students/:id/permissions` | PARENT | Grant teacher access | `STUDENT_PROFILE_UPDATED` or `ADMIN_ACTION` if admin |
+| DELETE | `/students/:id/permissions/:permission_id` | PARENT | Revoke teacher access | `STUDENT_PROFILE_UPDATED` |
+
+## 7.2 Parent ownership requirement
+
+Every student endpoint must enforce:
+
+```text
+student_profiles.parent_id = authenticated_parent.id
+```
+
+If false:
+
+```text
+403 STUDENT_ACCESS_DENIED
+```
+
+Never reveal whether another parent’s student exists.
+
+## 7.3 `POST /students`
+
+Purpose: Create student profile with minimized minor data.
+
+Request:
+
+```json
+{
+  "display_name": "Ahmed",
+  "birth_year": 2010,
+  "academic_level_id": "level_2as",
+  "school_year": "2026-2027",
+  "primary_goal": "Improve mathematics from 9/20 to 14/20",
+  "preferred_mode": "ONLINE",
+  "consent_status": "GRANTED"
+}
+```
+
+Validation:
+
+- `display_name` required.
+- Do not require full legal name.
+- `birth_year` must be plausible.
+- `academic_level_id` must exist and be active.
+- `consent_status` must be `GRANTED` to activate.
+
+Transaction boundary:
+
+```text
+BEGIN
+  insert student_profiles
+  insert event_ledger STUDENT_PROFILE_CREATED
+COMMIT
+```
+
+## 7.4 `GET /students/:id/passport`
+
+Returns Student Passport v0 from structured data.
+
+Source tables:
+
+```text
+sessions
+session_reports
+student_progress_events
+```
+
+No AI-generated claims are returned in MVP.
+
+Response:
+
+```json
+{
+  "data": {
+    "student_id": "stu_123",
+    "subjects": [
+      {
+        "subject_id": "sub_math",
+        "subject_name": "Mathematics",
+        "completed_sessions": 12,
+        "recent_topics": ["Algebra", "Functions"],
+        "recurring_weaknesses": ["Geometry", "Applied problem solving"],
+        "recent_progress_notes": [
+          "Improved participation in algebra exercises."
+        ]
+      }
+    ]
+  },
+  "request_id": "..."
+}
+```
+
+## 7.5 Student permissions
+
+`POST /students/:id/permissions`
+
+Purpose: Parent grants a teacher limited access to student context.
+
+Request:
+
+```json
+{
+  "teacher_id": "teacher_123",
+  "scope": "SESSION_CONTEXT",
+  "granted_for_booking_id": "booking_123",
+  "expires_at": "2026-10-01T00:00:00Z"
+}
+```
+
+Rules:
+
+- Parent must own student.
+- Teacher must exist.
+- If `granted_for_booking_id` exists, booking must belong to parent/student/teacher.
+- Teacher access expires or can be revoked.
+
+---
+
+# 8. Teacher APIs
+
+## 8.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| GET | `/teachers/:id` | Public/Auth | Public teacher profile | None |
+| GET | `/teachers/:id/trust-profile` | Public/Auth | Read trust profile | None |
+| GET | `/teachers/:id/reviews` | Public/Auth | Read verified reviews | None |
+| GET | `/teachers/me` | TEACHER | Own profile | None |
+| POST | `/teachers/me` | TEACHER | Create own profile | `TEACHER_PROFILE_CREATED` |
+| PATCH | `/teachers/me` | TEACHER | Update own profile | `TEACHER_PROFILE_UPDATED` |
+| POST | `/teachers/subjects` | TEACHER | Add offering | `TEACHER_PROFILE_UPDATED` |
+| PATCH | `/teachers/subjects/:id` | TEACHER | Update own offering | `TEACHER_PROFILE_UPDATED` |
+| DELETE | `/teachers/subjects/:id` | TEACHER | Deactivate offering | `TEACHER_PROFILE_UPDATED` |
+| POST | `/teachers/verifications` | TEACHER | Submit verification | `TEACHER_VERIFICATION_SUBMITTED` |
+| GET | `/teachers/verifications` | TEACHER | List own verifications | None |
+
+## 8.2 Teacher profile management
+
+`POST /teachers/me`
+
+Request:
+
+```json
+{
+  "public_name": "Nadia K.",
+  "bio": "Secondary mathematics teacher specializing in BAC preparation.",
+  "methodology": "Structured practice, diagnostic exercises, weekly progress notes.",
+  "experience_years": 6,
+  "languages": ["ar", "fr"],
+  "teaching_modes": ["ONLINE", "IN_PERSON"],
+  "base_wilaya_code": "16",
+  "base_commune": "Algiers Centre",
+  "service_area": "Algiers Centre, Kouba, Hydra"
+}
+```
+
+Rules:
+
+- Role must be `TEACHER`.
+- Teacher can only manage own profile.
+- `verification_status`, `listing_status`, and trust metrics are not freely editable.
+
+## 8.3 Teacher subjects
+
+`POST /teachers/subjects`
+
+Request:
+
+```json
+{
+  "subject_id": "sub_math",
+  "academic_level_id": "level_bac",
+  "price": {
+    "amount": "2000.00",
+    "currency": "DZD"
+  },
+  "session_duration_minutes": 60
+}
+```
+
+Rules:
+
+- Teacher must own profile.
+- Subject and academic level must exist and be active.
+- Duplicate teacher/subject/level combination is blocked by database.
+
+## 8.4 Verification submission
+
+`POST /teachers/verifications`
+
+Request:
+
+```json
+{
+  "verification_type": "QUALIFICATION",
+  "documents": [
+    {
+      "document_type": "degree_certificate",
+      "upload_token": "upload_tmp_123"
+    }
+  ],
+  "metadata": {
+    "institution": "University of Algiers",
+    "graduation_year": 2018
+  }
+}
+```
+
+Rules:
+
+- Document upload should use secure upload flow.
+- API stores metadata and storage key only.
+- Admin review changes status.
+- Teacher cannot self-approve verification.
+
+## 8.5 Trust profile read API
+
+`GET /teachers/:id/trust-profile`
+
+Response:
+
+```json
+{
+  "data": {
+    "teacher_id": "teacher_123",
+    "identity": { "verified": true },
+    "qualifications": { "verified": true },
+    "completed_sessions": 238,
+    "verified_rating": {
+      "average": "4.80",
+      "review_count": 91
+    },
+    "attendance_rate": "97.00",
+    "cancellation_rate": "2.00",
+    "average_response_time_seconds": 540,
+    "dispute_rate": "0.80",
+    "repeat_booking_rate": "62.00",
+    "calculated_at": "2026-09-01T10:00:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Critical rule:
+
+> No teacher API can create, update, or delete `teacher_trust_metrics`.
+
+Only metrics worker/admin-controlled recalculation may update it.
+
+---
+
+# 9. Matching APIs
+
+## 9.1 `POST /teachers/match`
+
+Purpose: Rule-based teacher matching for MVP.
+
+Role:
+
+- `PARENT` preferred.
+- Public search may be allowed with reduced data, but booking requires authentication.
+
+No AI is used.
+
+## 9.2 Request
+
+```json
+{
+  "student_id": "stu_123",
+  "subject_id": "sub_math",
+  "academic_level_id": "level_2as",
+  "goal": "Improve from 9/20 to 14/20",
+  "budget": {
+    "max_amount": "1500.00",
+    "currency": "DZD"
+  },
+  "mode": "ONLINE",
+  "availability": {
+    "preferred_days": [6],
+    "time_windows": [
+      { "start_local": "14:00", "end_local": "18:00" }
+    ],
+    "timezone": "Africa/Algiers"
+  },
+  "location": {
+    "wilaya_code": "16",
+    "commune": "Algiers Centre"
+  },
+  "preferred_language": "ar"
+}
+```
+
+## 9.3 Hard filters
+
+Teacher must:
+
+- Be listed.
+- Be verified according to MVP listing rules.
+- Teach selected subject.
+- Teach selected academic level.
+- Have active matching `teacher_subjects` row.
+- Have available slot within requested window.
+- Support selected teaching mode.
+- Match budget or appear only as explicitly marked alternative.
+
+## 9.4 Soft ranking factors
+
+- Verified identity.
+- Verified qualifications.
+- Completed sessions count.
+- Verified rating and review count.
+- Attendance rate.
+- Cancellation rate.
+- Response time.
+- Price fit.
+- Availability fit.
+- Location fit.
+- Repeat booking rate when enough data exists.
+
+## 9.5 Response
+
+Do not expose unexplained internal score as the main trust signal.
+
+```json
+{
+  "data": [
+    {
+      "teacher_id": "teacher_123",
+      "public_name": "Nadia K.",
+      "subject_offer": {
+        "teacher_subject_id": "ts_123",
+        "price": { "amount": "1500.00", "currency": "DZD" },
+        "session_duration_minutes": 60
+      },
+      "available_slots": [
+        {
+          "slot_id": "slot_123",
+          "starts_at": "2026-09-05T13:00:00Z",
+          "ends_at": "2026-09-05T14:00:00Z",
+          "timezone": "Africa/Algiers",
+          "mode": "ONLINE"
+        }
+      ],
+      "trust_profile_summary": {
+        "identity_verified": true,
+        "qualification_verified": true,
+        "completed_sessions": 238,
+        "verified_rating": "4.80",
+        "review_count": 91,
+        "attendance_rate": "97.00",
+        "cancellation_rate": "2.00"
+      },
+      "recommendation_reasons": [
+        "Teaches 2AS Mathematics",
+        "Available Saturday afternoon",
+        "Supports online sessions",
+        "Within your budget",
+        "238 verified sessions",
+        "97% attendance rate"
+      ]
+    }
+  ],
+  "pagination": {
+    "limit": 10,
+    "next_cursor": null,
+    "has_more": false
+  },
+  "request_id": "..."
+}
+```
+
+---
+
+# 10. Availability APIs
+
+## 10.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/teachers/availability/rules` | TEACHER | Create recurring rule | `SLOT_CREATED` or availability event via metadata |
+| GET | `/teachers/availability/rules` | TEACHER | List own rules | None |
+| PATCH | `/teachers/availability/rules/:id` | TEACHER | Update own rule | `SLOT_UPDATED` |
+| DELETE | `/teachers/availability/rules/:id` | TEACHER | Deactivate own rule | `SLOT_UPDATED` |
+| POST | `/teachers/availability/slots` | TEACHER | Create concrete slot | `SLOT_CREATED` |
+| GET | `/teachers/availability/slots` | TEACHER | List own slots | None |
+| POST | `/teachers/availability/slots/:id/block` | TEACHER | Block slot | `SLOT_BLOCKED` |
+| POST | `/teachers/availability/slots/:id/unblock` | TEACHER | Unblock slot | `SLOT_UPDATED` |
+| GET | `/availability/search` | PARENT/Public | Search available slots | None |
+
+## 10.2 Timezone behavior
+
+Rules:
+
+- Persist concrete slot timestamps as UTC in `starts_at` and `ends_at`.
+- Recurring rules store local `start_time`, `end_time`, and timezone.
+- Slot generation converts local rule time to UTC at generation time.
+- API clients must send timezone for local date/time input.
+- MVP default timezone is `Africa/Algiers`.
+
+Example create slot request:
+
+```json
+{
+  "starts_at_local": "2026-09-05T14:00:00",
+  "ends_at_local": "2026-09-05T15:00:00",
+  "timezone": "Africa/Algiers",
+  "mode": "ONLINE"
+}
+```
+
+Server persists:
+
+```json
+{
+  "starts_at": "2026-09-05T13:00:00Z",
+  "ends_at": "2026-09-05T14:00:00Z",
+  "timezone": "Africa/Algiers"
+}
+```
+
+## 10.3 Recurring rule generation
+
+`POST /teachers/availability/rules`
+
+Request:
+
+```json
+{
+  "day_of_week": 6,
+  "start_time": "14:00",
+  "end_time": "18:00",
+  "mode": "ONLINE",
+  "timezone": "Africa/Algiers",
+  "effective_from": "2026-09-01",
+  "effective_to": "2026-12-31",
+  "slot_duration_minutes": 60
+}
+```
+
+Behavior:
+
+- Create `availability_rules` row.
+- Generate concrete `availability_slots` for a bounded horizon, e.g. 4–8 weeks.
+- Background job may extend future slots.
+- All generated slots must pass overlap constraints.
+
+## 10.4 Changing rules with future bookings
+
+If teacher edits recurring rule:
+
+- Existing `BOOKED` slots remain unchanged.
+- Existing `HELD` slots remain until hold expiry or cancellation.
+- Future `AVAILABLE` generated slots may be updated/cancelled.
+- New rule applies only prospectively.
+- API must warn teacher if future booked sessions are unaffected.
+
+## 10.5 Prevent overlapping active slots
+
+API must check for conflicts before insert, but final protection is database exclusion constraint.
+
+Conflict response:
+
+```json
+{
+  "error": {
+    "code": "AVAILABILITY_OVERLAP",
+    "message": "This availability overlaps with an existing active slot.",
+    "request_id": "...",
+    "details": {
+      "conflicting_slot_id": "slot_456"
+    }
+  }
+}
+```
+
+---
+
+# 11. Booking APIs
+
+## 11.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/bookings/hold` | PARENT | Hold available slot | `BOOKING_CREATED`, `BOOKING_HELD` |
+| POST | `/bookings/:id/payment` | PARENT | Alias to initiate payment | `PAYMENT_INITIATED` |
+| POST | `/bookings/:id/confirm` | SYSTEM/OPS | Manual/system confirm only | `BOOKING_CONFIRMED` |
+| POST | `/bookings/:id/cancel` | PARENT/TEACHER/OPS/ADMIN | Cancel allowed booking | `BOOKING_CANCELLED` |
+| GET | `/bookings` | PARENT/TEACHER/OPS/ADMIN | List scoped bookings | None |
+| GET | `/bookings/:id` | PARENT/TEACHER/OPS/ADMIN | Get scoped booking | None |
+| POST | `/bookings/:id/reschedule` | PARENT/TEACHER/OPS | Reschedule under rules | `BOOKING_CANCELLED` + new booking events or `SLOT_UPDATED` |
+
+## 11.2 State transition authority
+
+Booking state transitions are not arbitrary status updates.
+
+| Transition | Authority | Endpoint | Notes |
+|---|---|---|---|
+| AVAILABLE slot → HELD booking | PARENT via system | `POST /bookings/hold` | Parent must own student. Slot locked. |
+| HELD → PAYMENT_PENDING | PARENT via system | `POST /payments/initiate` or `/bookings/:id/payment` | Payment attempt created. |
+| PAYMENT_PENDING → BOOKED | Verified payment provider webhook / OPS manual pilot | `POST /payments/webhooks/:provider` or `/bookings/:id/confirm` | Requires confirmed payment or approved manual payment rule. |
+| BOOKED → COMPLETED | System after session completed | Session completion endpoint | Parent/teacher cannot directly update booking status. |
+| HELD/PAYMENT_PENDING/BOOKED → CANCELLED | Parent/Teacher/OPS under policy | `/bookings/:id/cancel` | Role-specific rules. |
+| HELD → EXPIRED | System job | Internal | Hold expiry. |
+| COMPLETED → DISPUTED | Parent/Teacher/Admin through dispute | `POST /disputes` | Creates dispute. |
+| DISPUTED → REFUNDED | ADMIN/OPS through refund flow | `/payments/:id/refund` | Ledger reversal/refund required. |
+
+## 11.3 `POST /bookings/hold`
+
+Purpose: Parent holds an available slot for a limited time.
+
+Headers:
+
+```text
+Idempotency-Key: booking-hold-<uuid>
+```
+
+Request:
+
+```json
+{
+  "student_id": "stu_123",
+  "teacher_id": "teacher_123",
+  "teacher_subject_id": "ts_123",
+  "availability_slot_id": "slot_123"
+}
+```
+
+Validation:
+
+- Authenticated role is `PARENT`.
+- Student belongs to parent.
+- Teacher and offering exist.
+- Slot exists and status is `AVAILABLE`.
+- Slot teacher/time/mode matches selected offering and booking request.
+- Teacher listing is active.
+
+Transaction boundary:
+
+```text
+BEGIN
+  SELECT availability_slot FOR UPDATE
+  verify slot.status = AVAILABLE
+  verify student ownership
+  insert booking with status HELD
+  trigger updates slot to HELD
+  insert event_ledger BOOKING_CREATED
+  insert event_ledger BOOKING_HELD
+COMMIT
+```
+
+Concurrency:
+
+- Use row lock on slot.
+- Database unique partial index prevents duplicate active booking.
+- Database slot trigger prevents invalid slot state.
+
+## 11.4 Hold expiration
+
+Default hold duration: e.g. 10–15 minutes.
+
+System job:
+
+```text
+HELD + hold_expires_at < now() → EXPIRED
+slot → AVAILABLE
+event_ledger BOOKING_CANCELLED or dedicated expiry metadata
+```
+
+## 11.5 `POST /bookings/:id/confirm`
+
+This endpoint is **not** for parent or teacher arbitrary confirmation.
+
+Allowed only for:
+
+- Internal system service after payment confirmation, or
+- OPS/ADMIN for approved manual payment pilot flow.
+
+Request for OPS/manual pilot:
+
+```json
+{
+  "confirmation_reason": "CASH_PILOT_PAYMENT_VERIFIED",
+  "payment_id": "pay_123"
+}
+```
+
+Rules:
+
+- Booking must be `PAYMENT_PENDING` or `HELD` under approved manual pilot.
+- Payment must be confirmed or manually verified according to payment policy.
+- Creates scheduled session if immediate session materialization is approved. See Open Questions.
+
+## 11.6 `POST /bookings/:id/cancel`
+
+Allowed actors:
+
+- Parent: own booking, before cancellation deadline.
+- Teacher: own booking, under policy; affects cancellation metrics.
+- OPS/ADMIN: operational override with reason.
+
+Request:
+
+```json
+{
+  "reason": "Parent unavailable",
+  "requested_refund": true
+}
+```
+
+Rules:
+
+- Cannot cancel `COMPLETED` booking.
+- If payment confirmed, cancellation may create refund eligibility or dispute.
+- Cancellation reason and actor stored.
+- Event Ledger required.
+
+## 11.7 `POST /bookings/:id/reschedule`
+
+MVP recommendation: treat reschedule as controlled operation, not silent mutation.
+
+Request:
+
+```json
+{
+  "new_availability_slot_id": "slot_456",
+  "reason": "Parent requested new time"
+}
+```
+
+Behavior options:
+
+1. Preferred for auditability: cancel old booking and create new booking linked in metadata.
+2. Alternative: update booking slot if no payment/session risk exists.
+
+For MVP, use option 1 when payment already confirmed.
+
+---
+
+# 12. Payment APIs
+
+## 12.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/payments/initiate` | PARENT | Initiate payment for own booking | `PAYMENT_INITIATED` |
+| GET | `/payments/:id` | PARENT/OPS/ADMIN | Get scoped payment | None |
+| GET | `/payments` | PARENT/OPS/ADMIN | List scoped payments | None |
+| POST | `/payments/webhooks/:provider` | Provider/System | Process provider webhook | `PAYMENT_CONFIRMED` / `PAYMENT_FAILED` |
+| POST | `/payments/:id/refund` | OPS/ADMIN | Refund payment | `REFUND_ISSUED`, `PAYMENT_REFUNDED` |
+
+## 12.2 Payment provider abstraction
+
+Providers may include:
+
+```text
+CIB
+EDAHABIA
+CASH_PILOT
+BANK_TRANSFER
+OTHER
+```
+
+EduTrust must not claim it can legally hold customer funds without appropriate legal/payment-provider structure. MVP must use compliant payment infrastructure or a legally reviewed pilot workflow.
+
+## 12.3 `POST /payments/initiate`
+
+Request:
+
+```json
+{
+  "booking_id": "booking_123",
+  "provider": "CIB",
+  "return_url": "https://app.edutrust.dz/payment/return",
+  "cancel_url": "https://app.edutrust.dz/payment/cancel"
+}
+```
+
+Headers:
+
+```text
+Idempotency-Key: pay-init-<uuid>
+```
+
+Transaction boundary:
+
+```text
+BEGIN
+  verify parent owns booking
+  SELECT booking FOR UPDATE
+  verify booking.status in (HELD, PAYMENT_PENDING)
+  create payment row with status INITIATED and idempotency_key
+  update booking.status = PAYMENT_PENDING
+  insert event_ledger PAYMENT_INITIATED
+COMMIT
+
+Outside DB transaction:
+  call payment provider to create checkout/payment session
+
+BEGIN
+  update payment provider reference/init data if needed
+COMMIT
+```
+
+Never hold DB transaction while waiting on payment provider.
+
+## 12.4 Webhook processing: exact transaction flow
+
+`POST /payments/webhooks/:provider`
+
+Webhook business transaction must follow this exact flow:
+
+```text
+1. Authenticate/verify webhook
+2. Validate provider event
+3. Check idempotency
+4. Find payment
+5. Verify booking
+6. Verify amount
+7. Verify currency
+8. Update payment state
+9. Update booking state
+10. Create ledger transaction
+11. Create ledger entries
+12. Create event ledger entry
+13. Commit transaction
+```
+
+Recommended detailed implementation:
+
+```text
+Before transaction:
+  verify signature/header authenticity if possible
+  parse event safely
+  normalize event into provider_event object
+
+BEGIN
+  lock payment row by id/provider reference FOR UPDATE
+  lock booking row FOR UPDATE
+  check if event already processed
+    if duplicate successful event: return 200 with previous result
+  verify payment belongs to booking
+  verify amount == payment.amount == booking.price_amount
+  verify currency == DZD
+  update payment.status = CONFIRMED or FAILED
+  if CONFIRMED:
+    update booking.status = BOOKED
+    create ledger_transaction PARENT_PAYMENT
+    create balanced ledger_entries
+    optionally create scheduled session row if approved decision
+    insert event_ledger PAYMENT_CONFIRMED
+    insert event_ledger BOOKING_CONFIRMED
+  if FAILED:
+    update payment.status = FAILED
+    leave or expire booking based on policy
+    insert event_ledger PAYMENT_FAILED
+COMMIT
+```
+
+Duplicate webhook behavior:
+
+- Same provider event / transaction ID already processed successfully → return HTTP 200.
+- Same provider transaction ID with conflicting amount/currency → `409 PAYMENT_PROVIDER_CONFLICT`, log security/ops event.
+- Unknown payment reference → return provider-appropriate 200/404 behavior, but do not mutate business state; log for reconciliation.
+
+## 12.5 Provider transaction uniqueness
+
+Enforced by schema:
+
+```text
+UNIQUE(provider, provider_transaction_id)
+WHERE provider_transaction_id IS NOT NULL
+```
+
+## 12.6 Refund
+
+`POST /payments/:id/refund`
+
+Allowed roles:
+
+- OPS under policy.
+- ADMIN for elevated financial override.
+
+Request:
+
+```json
+{
+  "amount": "2000.00",
+  "currency": "DZD",
+  "reason": "Teacher no-show confirmed",
+  "dispute_id": "dispute_123"
+}
+```
+
+Transaction boundary:
+
+```text
+BEGIN
+  verify actor permission
+  lock payment and booking
+  verify payment.status in (CONFIRMED, DISPUTED)
+  create refund intent record or ledger_transaction REFUND according to approved schema approach
+  insert event_ledger REFUND_ISSUED
+COMMIT
+
+Outside DB transaction:
+  call provider refund API
+
+BEGIN
+  update payment status to REFUNDED/PARTIALLY_REFUNDED or REFUND_PENDING/FAILED
+  create reversal/settlement ledger entries as needed
+  insert event_ledger PAYMENT_REFUNDED if successful
+COMMIT
+```
+
+---
+
+# 13. Payment Data Security
+
+The database contains `payments.raw_provider_payload`. API services must handle it safely.
+
+## 13.1 What to store
+
+Preferred MVP approach:
+
+- Store normalized provider event fields required for reconciliation/debugging.
+- Store provider event ID, transaction ID, amount, currency, status, timestamps, non-sensitive metadata.
+- Store full raw payload only if legally/operationally necessary and after redaction.
+
+## 13.2 What to redact
+
+Never store unnecessarily:
+
+- Full card number
+- CVV
+- Sensitive authentication data
+- Unneeded personal identifiers
+- Full billing details if not required
+- Minor/student data
+
+## 13.3 Access control
+
+Raw/normalized provider payload is never exposed through:
+
+- Parent APIs
+- Teacher APIs
+- Public APIs
+
+Access only:
+
+- ADMIN: audited access for investigation.
+- OPS: limited normalized view.
+- SUPPORT: no raw payload by default.
+
+Every access to sensitive payment payload should create:
+
+```text
+security_events.ADMIN_ACCESS or DOCUMENT_ACCESS equivalent
+event_ledger.ADMIN_ACTION
+```
+
+## 13.4 Logging restrictions
+
+Do not log raw provider payload in application logs.
+
+Log only:
+
+```text
+payment_id
+booking_id
+provider
+provider_transaction_id
+status
+amount/currency
+request_id
+```
+
+## 13.5 Encryption and retention
+
+- Use encryption at rest for database/storage.
+- Consider application-level encryption for sensitive provider payload if full payload is retained.
+- Define retention policy before production launch.
+- Delete or anonymize unnecessary provider payload after reconciliation period where legally allowed.
+
+---
+
+# 14. Ledger APIs
+
+## 14.1 Ledger scope
+
+The EduTrust ledger is an:
+
+> Internal Marketplace Transaction Ledger.
+
+It is **not** a complete Algerian SCF accounting system.
+
+Do not implement full accounting, tax declarations, or statutory reporting in MVP. A future accounting/reporting layer can be built on top.
+
+## 14.2 Ledger creation
+
+Ledger transactions are created by internal services only, not public parent/teacher APIs.
+
+Examples:
+
+- Payment confirmed → `PARENT_PAYMENT`
+- Platform commission → part of payment ledger transaction
+- Teacher payout → `TEACHER_PAYOUT`
+- Refund → `REFUND`
+- Correction → `ADJUSTMENT` or reversal
+
+## 14.3 Debit/credit behavior
+
+Every ledger transaction must balance:
+
+```text
+sum(DEBIT) = sum(CREDIT)
+```
+
+Database deferred constraint trigger enforces balance.
+
+## 14.4 Immutable entries
+
+No UPDATE/DELETE of:
+
+```text
+ledger_entries
+```
+
+Corrections use reversal transactions.
+
+## 14.5 Admin visibility
+
+Suggested endpoints:
+
+| Method | URL | Role | Purpose |
+|---|---|---|---|
+| GET | `/admin/ledger/transactions` | OPS/ADMIN | Search ledger transactions |
+| GET | `/admin/ledger/transactions/:id` | OPS/ADMIN | View transaction + entries |
+| POST | `/admin/ledger/reversals` | ADMIN | Create reversal with reason |
+
+All admin ledger access/actions are audited.
+
+---
+
+# 15. Payout APIs
+
+## 15.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| GET | `/teacher/payouts` | TEACHER | List own payouts | None |
+| GET | `/teacher/payouts/:id` | TEACHER | View own payout | None |
+| POST | `/admin/payouts/process` | OPS/ADMIN | Process eligible payouts | `PAYOUT_ELIGIBLE`, `PAYOUT_PROCESSED` |
+| GET | `/admin/payouts` | OPS/ADMIN | Monitor payouts | None |
+
+## 15.2 Payout eligibility
+
+A payout item is eligible only if:
+
+```text
+session.status = COMPLETED
+session report exists
+confirmed payment exists
+teacher matches session teacher
+no open dispute exists
+```
+
+This is enforced by the database trigger `validate_payout_item_eligibility()` and must also be checked by API service logic.
+
+## 15.3 Payout process
+
+`POST /admin/payouts/process`
+
+Request:
+
+```json
+{
+  "teacher_id": "teacher_123",
+  "session_ids": ["session_1", "session_2"],
+  "idempotency_scope": "teacher_123_2026_09_batch_1"
+}
+```
+
+Headers:
+
+```text
+Idempotency-Key: payout-<uuid>
+```
+
+Transaction boundary:
+
+```text
+BEGIN
+  verify OPS/ADMIN permission
+  lock selected sessions/payments where needed
+  verify eligibility
+  create payout row
+  create payout_items
+  create ledger_transaction TEACHER_PAYOUT
+  create balanced ledger_entries
+  insert event_ledger PAYOUT_ELIGIBLE
+COMMIT
+
+Outside DB transaction:
+  call payout provider/bank process if applicable
+
+BEGIN
+  update payout status PAID/FAILED
+  insert event_ledger PAYOUT_PROCESSED if paid
+COMMIT
+```
+
+Failure handling:
+
+- If provider payout fails, payout status becomes `FAILED`.
+- Ledger correction/reversal depends on whether funds moved.
+- Never delete payout records.
+
+---
+
+# 16. Session APIs
+
+## 16.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| GET | `/sessions` | PARENT/TEACHER/OPS/ADMIN | List scoped sessions | None |
+| GET | `/sessions/:id` | PARENT/TEACHER/OPS/ADMIN | Get scoped session | None |
+| POST | `/sessions/:id/start` | TEACHER/OPS | Start session | `SESSION_STARTED` |
+| POST | `/sessions/:id/complete` | TEACHER/OPS | Complete session | `SESSION_COMPLETED` |
+| POST | `/sessions/:id/no-show` | TEACHER/PARENT/OPS | Record/report no-show | `SESSION_NO_SHOW` or dispute |
+
+## 16.2 Session state authority
+
+| Transition | Authority | Endpoint | Notes |
+|---|---|---|---|
+| SCHEDULED → STARTED | Teacher assigned to session, OPS override | `/sessions/:id/start` | Parent cannot start. |
+| STARTED → COMPLETED | Teacher assigned, OPS override | `/sessions/:id/complete` | Parent gets dispute window. |
+| SCHEDULED/STARTED → NO_SHOW_STUDENT | Teacher or OPS | `/sessions/:id/no-show` | Affects attendance. |
+| SCHEDULED → NO_SHOW_TEACHER | Parent reports; OPS confirms | `/sessions/:id/no-show` + dispute | Parent report alone may open dispute, not final metric. |
+| Any active → DISPUTED | Parent/Teacher via dispute | `/disputes` | Dispute workflow. |
+
+## 16.3 Parent confirmation
+
+MVP decision:
+
+- Teacher can mark session completed.
+- Parent does not need to confirm completion before report/review eligibility.
+- Parent has a dispute window.
+- Payout eligibility may wait until report exists and dispute window passes or no dispute is open.
+
+## 16.4 `POST /sessions/:id/start`
+
+Request:
+
+```json
+{
+  "started_at": "2026-09-05T13:02:00Z"
+}
+```
+
+Rules:
+
+- Actor must be assigned teacher or OPS.
+- Session status must be `SCHEDULED`.
+- Start time should be near scheduled window unless OPS override.
+
+Transaction:
+
+```text
+BEGIN
+  verify actor
+  SELECT session FOR UPDATE
+  update status STARTED, actual_start
+  insert event_ledger SESSION_STARTED
+COMMIT
+```
+
+## 16.5 `POST /sessions/:id/complete`
+
+Request:
+
+```json
+{
+  "completed_at": "2026-09-05T14:00:00Z",
+  "attendance_status": "PRESENT"
+}
+```
+
+Rules:
+
+- Actor must be assigned teacher or OPS.
+- Session must be `STARTED`, or OPS may complete from `SCHEDULED` with reason.
+- `actual_start`, `actual_end`, and `attendance_status = PRESENT` required.
+- API completion triggers booking `COMPLETED` through service or database synchronization.
+
+Transaction:
+
+```text
+BEGIN
+  verify actor
+  SELECT session FOR UPDATE
+  update session COMPLETED
+  booking status sync to COMPLETED
+  insert event_ledger SESSION_COMPLETED
+COMMIT
+```
+
+---
+
+# 17. Session Report APIs
+
+## 17.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/sessions/:id/report` | TEACHER | Create report | `REPORT_CREATED` |
+| GET | `/sessions/:id/report` | PARENT/TEACHER/OPS/ADMIN | View scoped report | None |
+| PATCH | `/sessions/:id/report` | TEACHER/OPS | Edit report under policy | `REPORT_CREATED` metadata or admin event |
+
+## 17.2 Report fields
+
+```text
+topics_covered
+skills_practiced
+participation
+teacher_observations
+homework
+recommended_revision
+next_objectives
+progress_indicator
+```
+
+Target teacher completion time: less than 2 minutes.
+
+## 17.3 Create report
+
+`POST /sessions/:id/report`
+
+Request:
+
+```json
+{
+  "topics_covered": ["Linear equations", "Functions basics"],
+  "skills_practiced": ["Solving equations", "Graph interpretation"],
+  "participation": "HIGH",
+  "teacher_observations": "Ahmed understood linear equations but needs more practice with word problems.",
+  "homework": "Complete exercises 4, 5, and 6 on functions.",
+  "recommended_revision": "Revise graph reading and applied problems.",
+  "next_objectives": ["Applied function problems", "Geometry basics"],
+  "progress_indicator": 2
+}
+```
+
+Rules:
+
+- Actor must be assigned teacher.
+- Session must be `COMPLETED`.
+- One report per session in MVP.
+- Report teacher/student/subject must match session.
+- No AI generation in MVP.
+
+Transaction boundary:
+
+```text
+BEGIN
+  verify teacher owns session
+  verify session COMPLETED
+  insert session_report
+  create student_progress_events from structured fields
+  insert event_ledger REPORT_CREATED
+COMMIT
+```
+
+## 17.4 Progress event creation
+
+From report:
+
+- Each topic → `TOPIC_COVERED`
+- Each skill → `SKILL_PRACTICED`
+- Homework → `HOMEWORK_ASSIGNED`
+- Observation text can create `PROGRESS_NOTE`
+- Weakness/strength extraction should be manual/structured in MVP, not AI.
+
+---
+
+# 18. Review APIs
+
+## 18.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/sessions/:id/review` | PARENT | Create verified review | `REVIEW_CREATED` |
+| GET | `/teachers/:id/reviews` | Public/Auth | List visible verified reviews | None |
+| POST | `/admin/reviews/:id/moderate` | OPS/ADMIN | Moderate review content | `ADMIN_ACTION` |
+
+## 18.2 Review eligibility
+
+Review is allowed only if:
+
+```text
+booking.status = COMPLETED
+payment.status = CONFIRMED
+session.status = COMPLETED
+review does not already exist
+reviewer is parent/guardian of the student
+reviewer is not teacher
+```
+
+Database trigger also enforces this.
+
+## 18.3 `POST /sessions/:id/review`
+
+Request:
+
+```json
+{
+  "rating": 5,
+  "comment": "Very clear explanations and a useful report after the session."
+}
+```
+
+Transaction boundary:
+
+```text
+BEGIN
+  verify parent owns session/student
+  verify eligibility
+  insert review
+  insert event_ledger REVIEW_CREATED
+COMMIT
+```
+
+Conflict examples:
+
+- Duplicate review → `409 DUPLICATE_REVIEW`
+- Session not completed → `422 REVIEW_NOT_ELIGIBLE`
+- Parent does not own student → `403 STUDENT_ACCESS_DENIED`
+
+## 18.4 Moderation behavior
+
+Admin/OPS can hide abusive comment text, but verified rating should not be silently deleted unless review is fraudulent or policy-violating.
+
+Moderation must be audited.
+
+---
+
+# 19. Dispute APIs
+
+## 19.1 Endpoint summary
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| POST | `/disputes` | PARENT/TEACHER | Open dispute | `DISPUTE_OPENED` |
+| GET | `/disputes` | PARENT/TEACHER/OPS/ADMIN | List scoped disputes | None |
+| GET | `/disputes/:id` | PARENT/TEACHER/OPS/ADMIN | View scoped dispute | None |
+| POST | `/admin/disputes/:id/resolve` | OPS/ADMIN | Resolve dispute | `DISPUTE_RESOLVED`, maybe `REFUND_ISSUED` |
+
+## 19.2 Categories
+
+```text
+TEACHER_NO_SHOW
+STUDENT_NO_SHOW
+SESSION_QUALITY
+PAYMENT_REFUND
+SAFETY
+REPORT_ISSUE
+OTHER
+```
+
+Safety disputes have highest priority.
+
+## 19.3 Create dispute
+
+`POST /disputes`
+
+Request:
+
+```json
+{
+  "booking_id": "booking_123",
+  "session_id": "session_123",
+  "payment_id": "pay_123",
+  "category": "SESSION_QUALITY",
+  "description": "The session ended after 30 minutes instead of 60 minutes.",
+  "evidence": [
+    { "type": "text", "value": "Parent note" }
+  ]
+}
+```
+
+Rules:
+
+- Actor must be participant in booking/session/payment.
+- At least one of booking/session/payment must be provided.
+- Safety category automatically priority `1`.
+- Open dispute may block payout.
+
+Transaction:
+
+```text
+BEGIN
+  verify actor access
+  insert dispute
+  update related booking/session/payment status to DISPUTED when policy requires
+  insert event_ledger DISPUTE_OPENED
+COMMIT
+```
+
+## 19.4 Resolve dispute
+
+`POST /admin/disputes/:id/resolve`
+
+Request:
+
+```json
+{
+  "resolution": "Partial refund approved due to shortened session.",
+  "action": "PARTIAL_REFUND",
+  "refund_amount": "1000.00",
+  "account_action": null
+}
+```
+
+Rules:
+
+- OPS can resolve operational disputes within policy.
+- ADMIN required for safety, account suspension, exceptional refund, or override.
+- Refund action must call refund service and create ledger/event entries.
+
+---
+
+# 20. Notification APIs
+
+## 20.1 Internal notification model
+
+External SMS/email/push providers are delivery channels, not source of truth.
+
+Source of truth:
+
+```text
+notifications table
+```
+
+## 20.2 Events
+
+```text
+booking confirmed
+booking cancelled
+session approaching
+session completed
+report available
+payment confirmed
+payment failed
+review requested
+dispute update
+```
+
+## 20.3 Statuses
+
+```text
+PENDING
+SENT
+DELIVERED
+FAILED
+READ
+```
+
+## 20.4 Endpoints
+
+| Method | URL | Role | Purpose |
+|---|---|---|
+| GET | `/notifications` | Authenticated | List own notifications |
+| POST | `/notifications/:id/read` | Authenticated | Mark own notification read |
+| POST | `/internal/notifications/send-pending` | Internal/OPS | Worker trigger for pending notifications |
+
+Notification creation should usually occur in the same transaction as the business event or immediately after via reliable job.
+
+---
+
+# 21. Admin APIs
+
+## 21.1 Teacher verification
+
+| Method | URL | Role | Purpose | Event |
+|---|---|---|---|---|
+| GET | `/admin/teachers/pending-verification` | OPS/ADMIN | List pending teachers | None |
+| GET | `/admin/teachers/:id/verifications` | OPS/ADMIN | View verification data | `ADMIN_ACTION` if sensitive |
+| POST | `/admin/teachers/:id/verify` | ADMIN/OPS policy | Approve verification | `TEACHER_VERIFIED`, `ADMIN_ACTION` |
+| POST | `/admin/teachers/:id/reject` | ADMIN/OPS policy | Reject verification | `TEACHER_REJECTED`, `ADMIN_ACTION` |
+
+Document access is audited separately.
+
+## 21.2 Booking/payment monitoring
+
+| Method | URL | Role | Purpose |
+|---|---|---|
+| GET | `/admin/bookings` | SUPPORT/OPS/ADMIN | Monitor bookings |
+| GET | `/admin/payments` | OPS/ADMIN | Monitor payments |
+| GET | `/admin/payments/:id` | OPS/ADMIN | Payment detail, redacted by default |
+
+## 21.3 Refunds and disputes
+
+| Method | URL | Role | Purpose |
+|---|---|---|
+| POST | `/payments/:id/refund` | OPS/ADMIN | Refund payment under policy |
+| GET | `/admin/disputes` | SUPPORT/OPS/ADMIN | Monitor disputes |
+| POST | `/admin/disputes/:id/resolve` | OPS/ADMIN | Resolve dispute |
+
+## 21.4 Review moderation
+
+| Method | URL | Role | Purpose |
+|---|---|---|
+| GET | `/admin/reviews` | SUPPORT/OPS/ADMIN | List reviews |
+| POST | `/admin/reviews/:id/moderate` | OPS/ADMIN | Hide/flag/remove content |
+
+## 21.5 Event ledger/security events
+
+| Method | URL | Role | Purpose |
+|---|---|---|
+| GET | `/admin/events` | OPS/ADMIN | Search event ledger |
+| GET | `/admin/security-events` | ADMIN | Search security events |
+
+## 21.6 User suspension
+
+| Method | URL | Role | Purpose |
+|---|---|---|
+| POST | `/admin/users/:id/suspend` | ADMIN | Suspend user |
+| POST | `/admin/users/:id/reactivate` | ADMIN | Reactivate user |
+
+Every admin operation:
+
+```text
+BEGIN
+  verify admin/ops/support permission
+  perform action
+  insert event_ledger ADMIN_ACTION
+COMMIT
+```
+
+---
+
+# 22. Event Ledger Integration
+
+## 22.1 Principle
+
+Every critical business operation must insert an `event_ledger` row.
+
+Prefer writing business state change and event in the same database transaction.
+
+## 22.2 Required event fields
+
+```json
+{
+  "actor_user_id": "user_123",
+  "actor_role": "PARENT",
+  "event_type": "BOOKING_CREATED",
+  "entity_type": "booking",
+  "entity_id": "booking_123",
+  "request_id": "req_uuid",
+  "idempotency_key": "booking-hold-uuid",
+  "metadata": {}
+}
+```
+
+## 22.3 Endpoint-to-event mapping
+
+| Endpoint/action | Event type | Entity |
+|---|---|---|
+| Register | `USER_REGISTERED` | user |
+| Login success | `USER_LOGIN` | user/session |
+| Student create | `STUDENT_PROFILE_CREATED` | student |
+| Teacher profile create/update | `TEACHER_PROFILE_CREATED` / `TEACHER_PROFILE_UPDATED` | teacher |
+| Verification submit | `TEACHER_VERIFICATION_SUBMITTED` | verification |
+| Admin verify teacher | `TEACHER_VERIFIED` | teacher |
+| Slot create/update/block | `SLOT_CREATED` / `SLOT_UPDATED` / `SLOT_BLOCKED` | slot |
+| Booking hold | `BOOKING_CREATED`, `BOOKING_HELD` | booking |
+| Booking confirmed | `BOOKING_CONFIRMED` | booking |
+| Booking cancelled | `BOOKING_CANCELLED` | booking |
+| Payment initiate | `PAYMENT_INITIATED` | payment |
+| Payment confirmed | `PAYMENT_CONFIRMED` | payment |
+| Payment failed | `PAYMENT_FAILED` | payment |
+| Refund issued | `REFUND_ISSUED` | payment/refund |
+| Session start | `SESSION_STARTED` | session |
+| Session complete | `SESSION_COMPLETED` | session |
+| No-show | `SESSION_NO_SHOW` | session |
+| Report create | `REPORT_CREATED` | report |
+| Review create | `REVIEW_CREATED` | review |
+| Dispute open | `DISPUTE_OPENED` | dispute |
+| Dispute resolve | `DISPUTE_RESOLVED` | dispute |
+| Payout eligible/processed | `PAYOUT_ELIGIBLE`, `PAYOUT_PROCESSED` | payout |
+| Admin action | `ADMIN_ACTION` | target entity |
+| Security event | `SECURITY_EVENT` | security event |
+
+---
+
+# 23. State Transition Rules
+
+## 23.1 Booking state machine
+
+```text
+HELD → PAYMENT_PENDING → BOOKED → COMPLETED
+```
+
+Side states:
+
+```text
+CANCELLED
+DISPUTED
+REFUNDED
+EXPIRED
+```
+
+No endpoint may accept arbitrary `status` input for bookings.
+
+## 23.2 Payment state machine
+
+```text
+NOT_STARTED → INITIATED → PENDING → CONFIRMED
+FAILED
+REFUND_PENDING → REFUNDED / PARTIALLY_REFUNDED
+DISPUTED
+```
+
+Only payment service/webhook/refund endpoints can transition payment states.
+
+## 23.3 Session state machine
+
+```text
+SCHEDULED → STARTED → COMPLETED
+```
+
+Side states:
+
+```text
+NO_SHOW_STUDENT
+NO_SHOW_TEACHER
+CANCELLED
+DISPUTED
+```
+
+Only assigned teacher or OPS/admin can complete sessions.
+
+## 23.4 Review eligibility
+
+Only parent/guardian can create review, and only after verified completed paid session.
+
+---
+
+# 24. Idempotency
+
+## 24.1 Required endpoints
+
+| Endpoint | Required? | Reason |
+|---|---|---|
+| `POST /bookings/hold` | Yes | Prevent duplicate holds/bookings |
+| `POST /payments/initiate` | Yes | Prevent duplicate payment attempts |
+| `POST /payments/webhooks/:provider` | Yes/provider event ID | Duplicate webhook delivery |
+| `POST /payments/:id/refund` | Yes | Prevent duplicate refunds |
+| `POST /admin/payouts/process` | Yes | Prevent duplicate payouts |
+| `POST /sessions/:id/review` | Recommended | DB unique constraint also protects |
+
+## 24.2 Idempotency key format
+
+Recommended:
+
+```text
+<operation>-<uuid-v4>
+```
+
+Examples:
+
+```text
+booking-hold-6f32c34f-3a9a-4c4a-92c0-0bb5cdb2f981
+pay-init-6f32c34f-3a9a-4c4a-92c0-0bb5cdb2f981
+refund-6f32c34f-3a9a-4c4a-92c0-0bb5cdb2f981
+```
+
+## 24.3 Replay behavior
+
+If the same actor sends the same idempotency key and same request body:
+
+- Return original response.
+
+If same key with different body:
+
+- Return `409 IDEMPOTENCY_KEY_CONFLICT`.
+
+## 24.4 Storage
+
+Payments already have `payments.idempotency_key`.
+
+For non-payment endpoints, API requires durable idempotency storage. This is a schema/API decision before coding.
+
+---
+
+# 25. Concurrency
+
+## 25.1 Two parents booking same slot
+
+Protection layers:
+
+1. API locks slot row:
+
+```sql
+SELECT * FROM availability_slots WHERE id = $1 FOR UPDATE;
+```
+
+2. API checks status = `AVAILABLE`.
+3. Booking insert occurs in same transaction.
+4. Database partial unique index prevents duplicate active booking.
+5. Slot trigger updates slot to `HELD`.
+
+## 25.2 Duplicate payment confirmation
+
+Protection layers:
+
+- Verify provider signature.
+- Lock payment row `FOR UPDATE`.
+- Unique provider transaction ID.
+- Unique confirmed payment per booking.
+- Idempotent webhook response.
+
+## 25.3 Duplicate webhook processing
+
+- Use provider event ID and provider_transaction_id.
+- If already confirmed with same details, return 200.
+- If conflicting details, log and reject mutation.
+
+## 25.4 Duplicate payout
+
+- `payout_items.session_id UNIQUE` prevents same session payout twice.
+- Payout processing requires idempotency key.
+- Lock eligible sessions/payments.
+
+## 25.5 Duplicate review
+
+- `reviews.session_id UNIQUE` prevents duplicate review.
+- Review endpoint verifies eligibility before insert.
+
+---
+
+# 26. Error Model
+
+## 26.1 Standard structure
+
+```json
+{
+  "error": {
+    "code": "INVALID_STATE_TRANSITION",
+    "message": "This booking cannot be confirmed from its current state.",
+    "request_id": "req_123",
+    "details": {
+      "current_state": "CANCELLED",
+      "allowed_states": ["PAYMENT_PENDING"]
+    }
+  }
+}
+```
+
+## 26.2 Common machine-readable codes
+
+```text
+AUTH_REQUIRED
+TOKEN_EXPIRED
+INVALID_REFRESH_TOKEN
+FORBIDDEN
+STUDENT_ACCESS_DENIED
+TEACHER_ACCESS_DENIED
+RESOURCE_NOT_FOUND
+VALIDATION_ERROR
+IDEMPOTENCY_KEY_REQUIRED
+IDEMPOTENCY_KEY_CONFLICT
+BOOKING_SLOT_UNAVAILABLE
+AVAILABILITY_OVERLAP
+INVALID_STATE_TRANSITION
+PAYMENT_AMOUNT_MISMATCH
+PAYMENT_CURRENCY_MISMATCH
+PAYMENT_PROVIDER_SIGNATURE_INVALID
+PAYMENT_PROVIDER_CONFLICT
+PAYMENT_NOT_CONFIRMED
+REVIEW_NOT_ELIGIBLE
+DUPLICATE_REVIEW
+PAYOUT_NOT_ELIGIBLE
+DISPUTE_ALREADY_OPEN
+RATE_LIMITED
+INTERNAL_ERROR
+```
+
+---
+
+# 27. Security Requirements
+
+## 27.1 Rate limiting
+
+Apply rate limits to:
+
+- Login
+- Register
+- Refresh token
+- Password reset if implemented
+- Teacher search/match
+- Booking hold
+- Payment initiation
+- Webhooks by provider/source
+
+## 27.2 Authentication hardening
+
+- Hash passwords with strong adaptive hash.
+- Store refresh token hashes only.
+- Rotate refresh tokens.
+- Revoke sessions on suspicious replay.
+- Enforce secure transport.
+
+## 27.3 RBAC and object-level authorization
+
+Every endpoint must check role + ownership.
+
+Examples:
+
+- Parent booking access: booking.parent_id = parent.id.
+- Teacher session access: session.teacher_id = teacher.id.
+- Admin action: role in `ADMIN`/`OPS` with action permission.
+
+## 27.4 Minor data protection
+
+- Minimize student fields.
+- Avoid unnecessary school/address/identity details.
+- Teachers see only relevant context.
+- Student Passport sharing requires permission.
+- Sensitive admin access is logged.
+
+## 27.5 Payment security
+
+- Verify webhooks.
+- Do not expose raw provider payload.
+- Do not log sensitive provider payload.
+- Use idempotency.
+- Reconcile provider records.
+
+## 27.6 Document security
+
+- Store documents in encrypted object storage.
+- PostgreSQL stores metadata and storage key only.
+- Access through short-lived signed URLs or secure proxy.
+- Every sensitive document access is audited.
+
+---
+
+# 28. Authorization Matrix
+
+| Endpoint / Action | Parent | Teacher | Support | OPS | Admin |
+|---|---:|---:|---:|---:|---:|
+| Register as parent/teacher | Yes | Yes | No | No | No |
+| Login/logout | Own | Own | Own | Own | Own |
+| Create student | Yes | No | No | No | Admin override only |
+| Read student | Own only | Permission/session context only | Limited | Limited | Yes |
+| Create teacher profile | No | Own | No | No | Admin override |
+| Edit teacher trust metrics | No | No | No | Metrics worker only | Controlled/admin recalculation |
+| Search/match teachers | Yes | Limited/public | Yes | Yes | Yes |
+| Create availability | No | Own | No | No | Admin override |
+| Hold booking | Own student | No | No | OPS override | Admin override |
+| Initiate payment | Own booking | No | No | No | Admin override |
+| Confirm payment/booking | No | No | No | Manual pilot only | Yes |
+| Payment webhook | Provider only | Provider only | Provider only | Provider only | Provider only |
+| Cancel booking | Own under policy | Own under policy | No | Yes | Yes |
+| Start session | No | Own | No | Yes | Yes |
+| Complete session | No | Own | No | Yes | Yes |
+| Create report | No | Own completed session | No | Override | Override |
+| Create review | Own completed session | No | No | No | Admin override not recommended |
+| Open dispute | Own | Own | Assist only | Yes | Yes |
+| Resolve dispute | No | No | No | Policy-limited | Yes |
+| View raw payment payload | No | No | No | Limited/redacted | Audited yes |
+| Access verification docs | No | Own submitted metadata only | No | Audited limited | Audited yes |
+| Process refund | No | No | No | Policy-limited | Yes |
+| Process payout | No | No | No | Yes | Yes |
+| Suspend user | No | No | No | No | Yes |
+| Event ledger access | No | No | No | Scoped | Full |
+
+---
+
+# 29. Transaction Boundaries
+
+## 29.1 Booking hold
+
+```text
+BEGIN
+  authenticate parent
+  authorize student ownership
+  lock slot FOR UPDATE
+  validate slot availability
+  create booking HELD
+  update slot HELD via trigger/service
+  insert event_ledger BOOKING_CREATED/BOOKING_HELD
+COMMIT
+```
+
+## 29.2 Payment initiation
+
+```text
+BEGIN
+  authorize parent booking ownership
+  lock booking FOR UPDATE
+  create payment INITIATED
+  update booking PAYMENT_PENDING
+  insert event_ledger PAYMENT_INITIATED
+COMMIT
+
+External provider call outside transaction.
+```
+
+## 29.3 Payment webhook confirmation
+
+```text
+Verify provider signature outside DB transaction.
+
+BEGIN
+  lock payment FOR UPDATE
+  lock booking FOR UPDATE
+  validate idempotency/provider event
+  validate amount/currency
+  update payment CONFIRMED
+  update booking BOOKED
+  create ledger transaction + balanced entries
+  insert event_ledger PAYMENT_CONFIRMED/BOOKING_CONFIRMED
+COMMIT
+```
+
+## 29.4 Session completion
+
+```text
+BEGIN
+  authorize teacher
+  lock session FOR UPDATE
+  update session COMPLETED
+  update/sync booking COMPLETED
+  insert event_ledger SESSION_COMPLETED
+COMMIT
+```
+
+## 29.5 Report creation
+
+```text
+BEGIN
+  authorize teacher
+  validate completed session
+  insert report
+  insert student_progress_events
+  insert event_ledger REPORT_CREATED
+COMMIT
+```
+
+## 29.6 Review creation
+
+```text
+BEGIN
+  authorize parent
+  validate completed paid session
+  insert review
+  insert event_ledger REVIEW_CREATED
+COMMIT
+```
+
+## 29.7 Refund
+
+```text
+BEGIN
+  authorize OPS/ADMIN
+  lock payment/booking
+  create refund intent/ledger reversal depending on provider state
+  insert event_ledger REFUND_ISSUED
+COMMIT
+
+External refund provider call outside transaction.
+
+BEGIN
+  update payment refund status
+  create final ledger entries/reversal if needed
+  insert event_ledger PAYMENT_REFUNDED
+COMMIT
+```
+
+---
+
+# 30. Complete P0 Endpoint Examples
+
+This section provides realistic examples for P0 endpoints. Error examples are representative and use the standard error model.
+
+---
+
+## 30.1 Register parent
+
+```http
+POST /api/v1/auth/register
+Content-Type: application/json
+X-Request-ID: 8b5f7b9e-5b0c-4eb1-8d6c-0edc9c4dd111
+```
+
+Request:
+
+```json
+{
+  "role": "PARENT",
+  "full_name": "Ahmed Benali",
+  "phone_e164": "+213555123456",
+  "email": "ahmed@example.com",
+  "password": "StrongPassword123!",
+  "preferred_locale": "ar-DZ"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "user_id": "user_123",
+    "role": "PARENT",
+    "access_token": "eyJ...",
+    "refresh_token": "rt_...",
+    "expires_in": 900
+  },
+  "request_id": "8b5f7b9e-5b0c-4eb1-8d6c-0edc9c4dd111"
+}
+```
+
+Validation error:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Either phone_e164 or email is required.",
+    "request_id": "...",
+    "details": { "field": "phone_e164" }
+  }
+}
+```
+
+---
+
+## 30.2 Login
+
+Request:
+
+```json
+{
+  "identifier": "+213555123456",
+  "password": "StrongPassword123!"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "user_id": "user_123",
+    "roles": ["PARENT"],
+    "access_token": "eyJ...",
+    "refresh_token": "rt_...",
+    "expires_in": 900
+  },
+  "request_id": "..."
+}
+```
+
+Authentication error:
+
+```json
+{
+  "error": {
+    "code": "AUTH_INVALID_CREDENTIALS",
+    "message": "Invalid credentials.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+## 30.3 Refresh token
+
+Request:
+
+```json
+{
+  "refresh_token": "rt_..."
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "access_token": "eyJ_new...",
+    "refresh_token": "rt_new...",
+    "expires_in": 900
+  },
+  "request_id": "..."
+}
+```
+
+---
+
+## 30.4 Create student
+
+```http
+POST /api/v1/students
+Authorization: Bearer <parent_access_token>
+```
+
+Request:
+
+```json
+{
+  "display_name": "Ahmed",
+  "birth_year": 2010,
+  "academic_level_id": "level_2as",
+  "school_year": "2026-2027",
+  "primary_goal": "Improve mathematics from 9/20 to 14/20",
+  "preferred_mode": "ONLINE",
+  "consent_status": "GRANTED"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "id": "stu_123",
+    "display_name": "Ahmed",
+    "academic_level_id": "level_2as",
+    "preferred_mode": "ONLINE",
+    "consent_status": "GRANTED",
+    "status": "ACTIVE",
+    "created_at": "2026-09-01T10:00:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Authorization error:
+
+```json
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Only parents can create student profiles.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+## 30.5 Create teacher profile
+
+```http
+POST /api/v1/teachers/me
+Authorization: Bearer <teacher_access_token>
+```
+
+Request:
+
+```json
+{
+  "public_name": "Nadia K.",
+  "bio": "Secondary mathematics teacher specializing in BAC preparation.",
+  "methodology": "Diagnostic exercises, structured practice, and progress reports.",
+  "experience_years": 6,
+  "languages": ["ar", "fr"],
+  "teaching_modes": ["ONLINE"],
+  "base_wilaya_code": "16",
+  "base_commune": "Algiers Centre"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "teacher_id": "teacher_123",
+    "public_name": "Nadia K.",
+    "verification_status": "UNVERIFIED",
+    "listing_status": "DRAFT"
+  },
+  "request_id": "..."
+}
+```
+
+---
+
+## 30.6 Add teacher subject offering
+
+Request:
+
+```json
+{
+  "subject_id": "sub_math",
+  "academic_level_id": "level_bac",
+  "price": { "amount": "2000.00", "currency": "DZD" },
+  "session_duration_minutes": 60
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "teacher_subject_id": "ts_123",
+    "teacher_id": "teacher_123",
+    "subject_id": "sub_math",
+    "academic_level_id": "level_bac",
+    "price": { "amount": "2000.00", "currency": "DZD" },
+    "session_duration_minutes": 60,
+    "is_active": true
+  },
+  "request_id": "..."
+}
+```
+
+Conflict:
+
+```json
+{
+  "error": {
+    "code": "DUPLICATE_TEACHER_SUBJECT",
+    "message": "This subject and academic level already exist for this teacher.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+## 30.7 Create availability slot
+
+Request:
+
+```json
+{
+  "starts_at_local": "2026-09-05T14:00:00",
+  "ends_at_local": "2026-09-05T15:00:00",
+  "timezone": "Africa/Algiers",
+  "mode": "ONLINE"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "slot_id": "slot_123",
+    "starts_at": "2026-09-05T13:00:00Z",
+    "ends_at": "2026-09-05T14:00:00Z",
+    "timezone": "Africa/Algiers",
+    "mode": "ONLINE",
+    "status": "AVAILABLE"
+  },
+  "request_id": "..."
+}
+```
+
+Conflict:
+
+```json
+{
+  "error": {
+    "code": "AVAILABILITY_OVERLAP",
+    "message": "This availability overlaps with an existing active slot.",
+    "request_id": "...",
+    "details": { "conflicting_slot_id": "slot_456" }
+  }
+}
+```
+
+---
+
+## 30.8 Match teachers
+
+Request:
+
+```json
+{
+  "student_id": "stu_123",
+  "subject_id": "sub_math",
+  "academic_level_id": "level_2as",
+  "goal": "Improve exam performance",
+  "budget": { "max_amount": "1500.00", "currency": "DZD" },
+  "mode": "ONLINE",
+  "availability": {
+    "preferred_days": [6],
+    "time_windows": [{ "start_local": "14:00", "end_local": "18:00" }],
+    "timezone": "Africa/Algiers"
+  },
+  "preferred_language": "ar"
+}
+```
+
+Success:
+
+```json
+{
+  "data": [
+    {
+      "teacher_id": "teacher_123",
+      "public_name": "Nadia K.",
+      "teacher_subject_id": "ts_123",
+      "price": { "amount": "1500.00", "currency": "DZD" },
+      "available_slots": [
+        {
+          "slot_id": "slot_123",
+          "starts_at": "2026-09-05T13:00:00Z",
+          "ends_at": "2026-09-05T14:00:00Z",
+          "mode": "ONLINE"
+        }
+      ],
+      "trust_profile_summary": {
+        "identity_verified": true,
+        "qualification_verified": true,
+        "completed_sessions": 238,
+        "verified_rating": "4.80",
+        "review_count": 91,
+        "attendance_rate": "97.00"
+      },
+      "recommendation_reasons": [
+        "Teaches 2AS Mathematics",
+        "Available Saturday afternoon",
+        "Within budget",
+        "238 verified sessions"
+      ]
+    }
+  ],
+  "pagination": { "limit": 10, "next_cursor": null, "has_more": false },
+  "request_id": "..."
+}
+```
+
+---
+
+## 30.9 Hold booking
+
+```http
+POST /api/v1/bookings/hold
+Authorization: Bearer <parent_access_token>
+Idempotency-Key: booking-hold-6f32c34f-3a9a-4c4a-92c0-0bb5cdb2f981
+```
+
+Request:
+
+```json
+{
+  "student_id": "stu_123",
+  "teacher_id": "teacher_123",
+  "teacher_subject_id": "ts_123",
+  "availability_slot_id": "slot_123"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "booking_id": "booking_123",
+    "status": "HELD",
+    "student_id": "stu_123",
+    "teacher_id": "teacher_123",
+    "slot_id": "slot_123",
+    "scheduled_start": "2026-09-05T13:00:00Z",
+    "scheduled_end": "2026-09-05T14:00:00Z",
+    "price": { "amount": "1500.00", "currency": "DZD" },
+    "hold_expires_at": "2026-09-01T10:15:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Conflict:
+
+```json
+{
+  "error": {
+    "code": "BOOKING_SLOT_UNAVAILABLE",
+    "message": "The selected slot is no longer available.",
+    "request_id": "...",
+    "details": { "slot_id": "slot_123" }
+  }
+}
+```
+
+---
+
+## 30.10 Initiate payment
+
+```http
+POST /api/v1/payments/initiate
+Authorization: Bearer <parent_access_token>
+Idempotency-Key: pay-init-6f32c34f-3a9a-4c4a-92c0-0bb5cdb2f981
+```
+
+Request:
+
+```json
+{
+  "booking_id": "booking_123",
+  "provider": "CIB",
+  "return_url": "https://app.edutrust.dz/payment/return",
+  "cancel_url": "https://app.edutrust.dz/payment/cancel"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "payment_id": "pay_123",
+    "booking_id": "booking_123",
+    "status": "INITIATED",
+    "provider": "CIB",
+    "amount": "1500.00",
+    "currency": "DZD",
+    "checkout_url": "https://provider.example/checkout/session_123"
+  },
+  "request_id": "..."
+}
+```
+
+Invalid state:
+
+```json
+{
+  "error": {
+    "code": "INVALID_STATE_TRANSITION",
+    "message": "Payment cannot be initiated for this booking state.",
+    "request_id": "...",
+    "details": { "booking_status": "CANCELLED" }
+  }
+}
+```
+
+---
+
+## 30.11 Payment webhook confirmed
+
+```http
+POST /api/v1/payments/webhooks/cib
+X-Provider-Signature: t=...,v1=...
+```
+
+Provider payload example, normalized internally:
+
+```json
+{
+  "event_id": "evt_123",
+  "type": "payment.confirmed",
+  "transaction_id": "provider_tx_123",
+  "payment_reference": "pay_123",
+  "amount": "1500.00",
+  "currency": "DZD",
+  "occurred_at": "2026-09-01T10:05:00Z"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "received": true,
+    "processed": true,
+    "payment_id": "pay_123",
+    "payment_status": "CONFIRMED",
+    "booking_id": "booking_123",
+    "booking_status": "BOOKED"
+  },
+  "request_id": "..."
+}
+```
+
+Duplicate webhook:
+
+```json
+{
+  "data": {
+    "received": true,
+    "processed": false,
+    "duplicate": true,
+    "payment_id": "pay_123",
+    "payment_status": "CONFIRMED"
+  },
+  "request_id": "..."
+}
+```
+
+Signature error:
+
+```json
+{
+  "error": {
+    "code": "PAYMENT_PROVIDER_SIGNATURE_INVALID",
+    "message": "Invalid payment provider signature.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+## 30.12 Get booking
+
+```http
+GET /api/v1/bookings/booking_123
+Authorization: Bearer <parent_or_teacher_access_token>
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "booking_id": "booking_123",
+    "status": "BOOKED",
+    "payment_status": "CONFIRMED",
+    "session_id": "session_123",
+    "student": { "id": "stu_123", "display_name": "Ahmed" },
+    "teacher": { "id": "teacher_123", "public_name": "Nadia K." },
+    "subject_id": "sub_math",
+    "academic_level_id": "level_2as",
+    "scheduled_start": "2026-09-05T13:00:00Z",
+    "scheduled_end": "2026-09-05T14:00:00Z",
+    "price": { "amount": "1500.00", "currency": "DZD" }
+  },
+  "request_id": "..."
+}
+```
+
+Authorization error:
+
+```json
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "You do not have access to this booking.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+## 30.13 Start session
+
+Request:
+
+```json
+{
+  "started_at": "2026-09-05T13:02:00Z"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "session_id": "session_123",
+    "status": "STARTED",
+    "actual_start": "2026-09-05T13:02:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Invalid actor:
+
+```json
+{
+  "error": {
+    "code": "TEACHER_ACCESS_DENIED",
+    "message": "Only the assigned teacher can start this session.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+## 30.14 Complete session
+
+Request:
+
+```json
+{
+  "completed_at": "2026-09-05T14:00:00Z",
+  "attendance_status": "PRESENT"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "session_id": "session_123",
+    "status": "COMPLETED",
+    "attendance_status": "PRESENT",
+    "actual_start": "2026-09-05T13:02:00Z",
+    "actual_end": "2026-09-05T14:00:00Z",
+    "booking_status": "COMPLETED"
+  },
+  "request_id": "..."
+}
+```
+
+---
+
+## 30.15 Create session report
+
+Request:
+
+```json
+{
+  "topics_covered": ["Linear equations", "Functions basics"],
+  "skills_practiced": ["Equation solving", "Graph reading"],
+  "participation": "HIGH",
+  "teacher_observations": "Good progress in equations. Needs more applied problem-solving practice.",
+  "homework": "Exercises 4, 5, and 6.",
+  "recommended_revision": "Review function graphs.",
+  "next_objectives": ["Applied problems", "Geometry basics"],
+  "progress_indicator": 2
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "report_id": "report_123",
+    "session_id": "session_123",
+    "student_progress_events_created": 6,
+    "created_at": "2026-09-05T14:05:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Invalid state:
+
+```json
+{
+  "error": {
+    "code": "INVALID_STATE_TRANSITION",
+    "message": "A report can only be created for a completed session.",
+    "request_id": "...",
+    "details": { "session_status": "STARTED" }
+  }
+}
+```
+
+---
+
+## 30.16 Create review
+
+Request:
+
+```json
+{
+  "rating": 5,
+  "comment": "Excellent explanation and useful session report."
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "review_id": "review_123",
+    "session_id": "session_123",
+    "teacher_id": "teacher_123",
+    "rating": 5,
+    "is_verified": true,
+    "status": "VISIBLE",
+    "created_at": "2026-09-05T15:00:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Duplicate:
+
+```json
+{
+  "error": {
+    "code": "DUPLICATE_REVIEW",
+    "message": "A review already exists for this session.",
+    "request_id": "...",
+    "details": { "session_id": "session_123" }
+  }
+}
+```
+
+---
+
+## 30.17 Open dispute
+
+Request:
+
+```json
+{
+  "booking_id": "booking_123",
+  "session_id": "session_123",
+  "category": "REPORT_ISSUE",
+  "description": "The report does not reflect what happened in the session."
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "dispute_id": "dispute_123",
+    "status": "OPEN",
+    "category": "REPORT_ISSUE",
+    "priority": 3,
+    "created_at": "2026-09-05T15:10:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Safety dispute response:
+
+```json
+{
+  "data": {
+    "dispute_id": "dispute_456",
+    "status": "OPEN",
+    "category": "SAFETY",
+    "priority": 1,
+    "message": "Your safety report has been prioritized. Support will review it urgently."
+  },
+  "request_id": "..."
+}
+```
+
+---
+
+## 30.18 Admin teacher verification
+
+```http
+POST /api/v1/admin/teachers/teacher_123/verify
+Authorization: Bearer <admin_access_token>
+```
+
+Request:
+
+```json
+{
+  "verification_type": "QUALIFICATION",
+  "decision": "APPROVED",
+  "reviewer_note": "Degree document reviewed and accepted."
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "teacher_id": "teacher_123",
+    "verification_type": "QUALIFICATION",
+    "verification_status": "QUALIFICATION_REVIEWED",
+    "reviewed_at": "2026-09-01T12:00:00Z"
+  },
+  "request_id": "..."
+}
+```
+
+Authorization error:
+
+```json
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "This operation requires ADMIN or authorized OPS permission.",
+    "request_id": "...",
+    "details": {}
+  }
+}
+```
+
+---
+
+# 31. Implementation Notes
+
+## 31.1 Suggested module boundaries inside modular monolith
+
+```text
+AuthModule
+UserModule
+ParentStudentModule
+TeacherModule
+VerificationModule
+SearchMatchingModule
+AvailabilityModule
+BookingModule
+PaymentModule
+LedgerModule
+PayoutModule
+SessionModule
+ReportModule
+ReviewModule
+DisputeModule
+NotificationModule
+AdminModule
+EventLedgerModule
+```
+
+These are code modules, not microservices.
+
+## 31.2 Service-layer rules
+
+Each state-changing endpoint should be implemented through a service method, not direct controller/database writes.
+
+Examples:
+
+```text
+BookingService.holdSlot()
+PaymentService.initiatePayment()
+PaymentWebhookService.confirmPayment()
+SessionService.completeSession()
+ReportService.createReport()
+ReviewService.createVerifiedReview()
+PayoutService.processPayout()
+```
+
+## 31.3 Testing requirements before implementation acceptance
+
+Must include tests for:
+
+- Parent cannot access another parent’s student.
+- Two concurrent booking holds for same slot.
+- Duplicate payment initiation idempotency.
+- Duplicate webhook delivery.
+- Webhook amount mismatch.
+- Review before completion blocked.
+- Duplicate review blocked.
+- Teacher self-review blocked.
+- Payout blocked when report missing.
+- Payout blocked when dispute open.
+- Event Ledger row created for each critical action.
+- Raw payment provider payload not exposed through parent/teacher APIs.
+
+---
+
+# 32. Schema/API Conflicts Requiring Decision
+
+The database is approved as baseline. The following are not redesigns, but decisions needed before coding.
+
+## 32.1 General API idempotency storage
+
+Issue:
+
+- `payments.idempotency_key` exists.
+- `event_ledger.idempotency_key` exists but is not unique and is not designed as a response replay store.
+- Non-payment endpoints also require idempotency, especially `POST /bookings/hold`, refunds, and payouts.
+
+Decision required:
+
+1. Add a small `api_idempotency_keys` table before implementation, or
+2. Use another durable store with equivalent consistency guarantees.
+
+Recommendation:
+
+> Add `api_idempotency_keys` in the same PostgreSQL database before coding. Do not rely only on Redis/cache for financial or booking idempotency.
+
+## 32.2 Session row materialization timing
+
+Issue:
+
+- `sessions` table requires a BOOKED booking and confirmed payment.
+- Session APIs require a `session_id`.
+- Payment webhook flow confirms booking but the prompt did not explicitly list session creation in its 13 webhook steps.
+
+Decision required:
+
+1. Create scheduled `sessions` row inside the payment-confirmation transaction after booking becomes `BOOKED`, or
+2. Create scheduled `sessions` row through a reliable internal handler immediately after booking confirmation.
+
+Recommendation:
+
+> Create session synchronously in the same transaction as payment confirmation after step 9, while keeping the requested payment transaction flow intact. If not accepted, use a guaranteed internal job and block session start until session exists.
+
+## 32.3 Refund history granularity
+
+Issue:
+
+- Schema has payment status and ledger transactions but no dedicated `refunds` table.
+- MVP can represent refunds through ledger transactions and event ledger.
+- Multiple partial refunds or provider-specific refund lifecycle may require a dedicated refund entity.
+
+Decision required:
+
+1. MVP single/partial refund tracked through `ledger_transactions`, `payments.status`, `disputes`, and `event_ledger`, or
+2. Add `refunds` table before coding.
+
+Recommendation:
+
+> For MVP, if only simple refunds are supported, keep schema. If partial/multiple refunds are required, add a `refunds` table before implementation.
+
+## 32.4 Event types for availability rule changes
+
+Issue:
+
+- Event enum includes `SLOT_CREATED`, `SLOT_UPDATED`, `SLOT_BLOCKED` but not separate `AVAILABILITY_RULE_CREATED`.
+
+Decision required:
+
+- Use slot events with metadata for rule changes, or add availability-rule-specific event types.
+
+Recommendation:
+
+> For MVP, use `SLOT_CREATED/SLOT_UPDATED` with metadata `{ "source": "availability_rule" }`.
+
+## 32.5 Trust metrics update guard
+
+Issue:
+
+- `teacher_trust_metrics` trigger requires session variable `edutrust.internal_metric_update = on`.
+
+Decision required:
+
+- Metrics worker must use a DB role or transaction setting authorized to update metrics.
+
+Recommendation:
+
+> Keep metrics worker separate from normal API runtime privileges.
+
+---
+
+# 33. Open Questions / Decisions Required Before Coding
+
+1. Which payment provider will be used first: CIB, Edahabia, bank transfer, or controlled pilot workflow?
+2. What is the legally approved payment flow for holding/settling funds and teacher payouts in Algeria?
+3. What is the cancellation/refund policy by timing and actor?
+4. What is the parent dispute window after teacher marks session complete?
+5. Should session row be created synchronously during payment confirmation?
+6. Should a general `api_idempotency_keys` table be added before coding?
+7. Is a dedicated `refunds` table required for MVP?
+8. What is the retention policy for payment provider payloads?
+9. What is the retention/deletion policy for minors’ data and verification documents?
+10. Should PostgreSQL Row-Level Security be implemented in MVP or deferred while service-layer authorization is enforced?
+11. What exact admin permissions distinguish SUPPORT vs OPS vs ADMIN?
+12. What is the initial hold duration: 10 minutes or 15 minutes?
+13. How long after session completion is payout eligible if no dispute is opened?
+14. What document storage provider and encryption mechanism will be used?
+15. What SMS/email provider will be used for critical notifications?
+
+---
+
+# 34. Explicit Non-Goals
+
+Do not introduce in MVP API:
+
+- AI tutor
+- Advanced AI analysis
+- Session recording
+- Microservices
+- Subscriptions
+- Group classes
+- Predictive analytics
+- Advanced referral engine
+- Public teacher leaderboard
+- Paid ranking
+
+These remain outside MVP.
+
+---
+
+# 35. Final API Architecture Decision
+
+EduTrust API v1.0 is approved for specification review if it preserves these rules:
+
+```text
+No arbitrary state updates.
+No payment webhook partial state.
+No unverified reviews.
+No teacher-editable trust metrics.
+No AI-generated Student Passport source of truth.
+No frontend-only concurrency protection.
+No raw payment payload exposure.
+No admin action without audit event.
+```
+
+The next document after this API architecture should be:
+
+> EduTrust State Machines v1.0
+
+with formal transition tables for:
+
+```text
+Booking
+Payment
+Session
+Review
+Dispute
+Payout
+```
