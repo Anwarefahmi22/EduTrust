@@ -56,6 +56,28 @@ def logout_view(request):
     logout(request.user.id, request.user.session_id, request_id=getattr(request, "request_id", None))
     return Response({"data": {"status": "logged_out"}, "request_id": getattr(request, "request_id", None)})
 
+# ---- DEV Vertical Slice 10: R6 Auth completion views (VS10 R6 Authorization D1/D2) ----
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([])
+def refresh_view(request):
+    from .services import refresh_tokens
+    # D1.1: single required field; the endpoint IS the re-authentication (no Bearer required).
+    data = refresh_tokens(request.data.get("refresh_token") or "", request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+def revoke_sessions_view(request):
+    from .services import revoke_sessions
+    if not request.user or not request.user.is_authenticated:
+        raise ApiError("AUTH_REQUIRED", "Authentication is required.", 401)
+    # D2: self-service — the caller's own sessions only; the current session comes
+    # from the verified JWT sid claim (server-derived), never from the request body.
+    data = revoke_sessions(request.user.id, request.data.get("scope") or "", request.user.session_id, request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
 @api_view(["POST"])
 @require_roles("PARENT")
 def students_create(request):

@@ -445,3 +445,58 @@ PG_BIN=<pg bin dir> python tests/e2e_dispute_resolution.py
 # 75/75 checks PASS (15 scenarios + 11 DB-level financial-integrity gates)
 ```
 
+## DEV Vertical Slice #10
+
+Implemented R6 auth completion (session refresh + session revocation) on the existing approved baseline (no schema, state-machine, or architecture changes):
+
+```text
+POST /api/v1/auth/refresh
+  Strict one-use rotation (D3a baseline): sha256(token) → active auth_sessions row
+  (FOR UPDATE) → new token hash stored in the SAME transaction (the old token is
+  dead by replacement) → access token re-issued for the SAME session (sid preserved,
+  roles re-read from DB, existing TTL). Uniform 401 for unknown/revoked/expired/
+  rotated-out tokens (no existence oracle). Session lifetime NOT extended.
+  Rotated-token reuse = schema-limited (uniform 401, no detection event —
+  D3a documented limitation; D3b previous-hash detection deferred, not implemented).
+
+POST /api/v1/auth/revoke-sessions
+  Self-service only (own sessions; scope from the verified JWT, never the body):
+  { "scope": "CURRENT" | "OTHERS" | "ALL" } → guarded UPDATE revoked_at per row;
+  one TOKEN_REVOKED security event + SECURITY_EVENT ledger row per actually-revoked
+  session; response = the self-count only (no ids, no tokens).
+```
+
+- No new event values (existing `TOKEN_REVOKED`/`SECURITY_EVENT` only); no ledger/financial surface; no D3b marker; no admin session surface (none approved).
+- Frontend: `lib/api.ts` refresh-on-expiry hook (single in-flight refresh, one retry, logged-out state) — opt-in; no console screens (none approved for R6).
+- Concurrency: existing `auth_sessions` row-lock strategy (leaf object — acyclic); two simultaneous same-token refreshes → exactly one rotation.
+
+VS10 endpoints:
+
+```text
+POST /api/v1/auth/refresh            # unauthenticated (token is the credential), uniform 401 class
+POST /api/v1/auth/revoke-sessions    # authenticated, own sessions only, scope CURRENT/OTHERS/ALL
+```
+
+Current automated backend tests:
+
+```bash
+./scripts/run_backend_tests.sh
+# 225 passed (197 baseline regression + 28 VS10: 23 service + 5 concurrency)
+```
+
+VS10 E2E (standalone, isolated runtime):
+
+```bash
+PG_BIN=<pg bin dir> python tests/e2e_auth_completion.py
+# 33/33 checks PASS (8 scenarios, D3a replay semantics verified)
+```
+
+Strict boundaries (unchanged):
+
+```text
+Real payment: forbidden
+Real refund: forbidden
+Real payout: forbidden
+D3b previous-hash detection: deferred (not implemented, no schema change)
+Production: forbidden
+```

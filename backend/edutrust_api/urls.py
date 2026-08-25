@@ -5,6 +5,9 @@ urlpatterns = [
     path("auth/register", views.register),
     path("auth/login", views.login_view),
     path("auth/logout", views.logout_view),
+    # DEV Vertical Slice 10: R6 auth completion
+    path("auth/refresh", views.refresh_view),
+    path("auth/revoke-sessions", views.revoke_sessions_view),
     path("students", views.students_create),
     path("students/<uuid:student_id>", views.students_detail),
     path("teachers/me", views.teachers_me),

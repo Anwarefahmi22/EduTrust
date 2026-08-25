@@ -3039,3 +3039,114 @@ def list_admin_disputes(user_id: str, roles: list[str], params: dict, request_id
         "data": items,
         "pagination": {"limit": limit, "next_cursor": items[-1]["id"] if has_more else None, "has_more": has_more},
     }
+
+
+# ---- DEV Vertical Slice 10: R6 Auth completion (approved: VS10 R6 Implementation
+# Authorization v1.0 — D1/D2 locks + D3a baseline) ----
+#
+# POST /auth/refresh (D1) and POST /auth/revoke-sessions (D2).
+# D3a baseline: strict one-use rotation over the EXISTING auth_sessions schema
+# (one current hash per session; no previous-hash column, no token history, no
+# session family, no schema change). A rotated-out token is unrecoverable as
+# "this session's old token" — it fails verification exactly like any unknown
+# token (uniform 401). That is the schema-supported extent of API §3.5 bullet 5
+# under its own "where supported" clause; the limitation is documented in the
+# slice report (compliance note). No security downgrade: the old token is dead
+# by hash replacement in the same transaction.
+
+REVOKE_SCOPES = ("CURRENT", "OTHERS", "ALL")
+
+
+def refresh_tokens(refresh_token: str, request_id: str | None = None) -> dict:
+    """POST /api/v1/auth/refresh (D1). Atomically rotate the refresh token of an
+    active session; re-issue the access token for the SAME session (sid preserved,
+    roles re-read server-side, existing TTL conventions)."""
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise ApiError("AUTH_INVALID_REFRESH_TOKEN", "Invalid or expired refresh token.", 401)
+    token_hash = hash_token(refresh_token.strip())
+    with tx():
+        session = fetchone(
+            "SELECT id::text, user_id::text, revoked_at, expires_at "
+            "FROM edutrust.auth_sessions WHERE refresh_token_hash = %s FOR UPDATE",
+            [token_hash],
+        )
+        # Uniform 401 for every token-validation outcome (D1.5/D3.3): unknown hash,
+        # revoked session, expired session, rotated-out (old) token — indistinguishable,
+        # no existence oracle (D3.4).
+        if not session or session["revoked_at"] is not None or session["expires_at"] <= timezone.now():
+            raise ApiError("AUTH_INVALID_REFRESH_TOKEN", "Invalid or expired refresh token.", 401)
+        session_id = session["id"]
+        user_id = session["user_id"]
+        # D1.3: rotation PRESERVES the session's existing expires_at (no extension).
+        # §3.5 bullets 2-4: rotate + store new hash + revoke the old token in the SAME
+        # transaction (the hash replacement is the old token's invalidation).
+        new_token = generate_token()
+        execute(
+            "UPDATE edutrust.auth_sessions SET refresh_token_hash = %s WHERE id = %s",
+            [hash_token(new_token), session_id],
+        )
+    # No event on successful rotation (D1.6). Access token: existing structure,
+    # same sid claim, existing TTL (make_access_token unchanged). Roles re-read
+    # server-side (never taken from the prior token).
+    roles = get_roles(user_id)
+    return {
+        "access_token": make_access_token(user_id, roles, session_id),
+        "refresh_token": new_token,
+        "expires_in": settings.JWT_ACCESS_TTL_SECONDS,
+    }
+
+
+def revoke_sessions(user_id: str, scope: str, current_session_id: str | None, request_id: str | None = None) -> dict:
+    """POST /api/v1/auth/revoke-sessions (D2). Self-service only: acts exclusively on
+    the CALLER's sessions (ownership enforced server-side; the contract carries no
+    user/session-id parameters, so cross-user targeting is structurally impossible).
+    Only sessions that actually transition to revoked emit events (D2.3)."""
+    if scope not in REVOKE_SCOPES:
+        raise ApiError(
+            "VALIDATION_ERROR",
+            'scope must be one of "CURRENT", "OTHERS", "ALL".',
+            400,
+            {"scopes": list(REVOKE_SCOPES)},
+        )
+    with tx():
+        if scope == "CURRENT":
+            candidates = fetchall(
+                "SELECT id::text FROM edutrust.auth_sessions "
+                "WHERE id = %s AND user_id = %s AND revoked_at IS NULL FOR UPDATE",
+                [current_session_id, user_id],
+            )
+        elif scope == "OTHERS":
+            candidates = fetchall(
+                "SELECT id::text FROM edutrust.auth_sessions "
+                "WHERE user_id = %s AND id <> %s AND revoked_at IS NULL FOR UPDATE",
+                [user_id, current_session_id],
+            )
+        else:  # ALL
+            candidates = fetchall(
+                "SELECT id::text FROM edutrust.auth_sessions "
+                "WHERE user_id = %s AND revoked_at IS NULL FOR UPDATE",
+                [user_id],
+            )
+        revoked = 0
+        for cand in candidates:
+            sid = cand["id"]
+            # Guarded flip (logout convention); idempotent — a session already revoked
+            # by a concurrent call is not re-flipped and emits no duplicate event (D2.4).
+            flipped = execute(
+                "UPDATE edutrust.auth_sessions SET revoked_at = now() "
+                "WHERE id = %s AND user_id = %s AND revoked_at IS NULL",
+                [sid, user_id],
+            )
+            if flipped:
+                revoked += 1
+                write_security_event(
+                    "TOKEN_REVOKED", user_id=user_id, severity=1,
+                    metadata={"request_id": request_id, "session_id": sid},
+                )
+                write_event(
+                    "SECURITY_EVENT", "auth_session", sid,
+                    actor_user_id=user_id, actor_role=None,
+                    request_id=request_id, metadata={"event": "TOKEN_REVOKED"},
+                )
+    # D2.2: self-count only — no session identifiers, no token values, no details.
+    return {"revoked": revoked}
