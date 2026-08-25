@@ -22,6 +22,7 @@ export default function ParentDashboardShell() {
   const [disputeCategory, setDisputeCategory] = useState('SESSION_QUALITY')
   const [disputeDesc, setDisputeDesc] = useState('')
   const [myDisputes, setMyDisputes] = useState<any[]>([])
+  const [disputeDetail, setDisputeDetail] = useState<any | null>(null)
   const [refundState, setRefundState] = useState('')
   const addLog = (m: string) => setLog((l) => [m, ...l].slice(0, 12))
   // UX v1.1 Patch 1 parent-facing labels; "completed" (refunded) only when SUCCEEDED.
@@ -115,6 +116,13 @@ export default function ParentDashboardShell() {
     setMyDisputes(res.data || [])
     addLog(`My disputes: ${res.data.length}`)
   }
+  async function viewDispute(id: string) {
+    try {
+      const res: any = await apiGet(`/api/v1/disputes/${id}`, token)
+      setDisputeDetail(res.data)
+    } catch (e: any) { addLog(`Dispute detail rejected: ${e.message}`) }
+  }
+  const refundLabel = (s: string) => (REFUND_PARENT_LABEL as Record<string, string>)[s] || s
 
   return <>
     <section className="card"><span className="badge info">Parent vertical slice</span><h1>Parent Dashboard</h1><p className="muted">DEV marketplace flow only. No real payment.</p></section>
@@ -147,7 +155,15 @@ export default function ParentDashboardShell() {
       <button onClick={loadMyReviews} disabled={!token}>My reviews</button>
       <button onClick={loadMyDisputes} disabled={!token}>My disputes</button>
       <ul>{myReviews.map(r=><li key={r.id}>{r.rating}★ {r.teacher_public_name || ''} — verified={r.is_verified} ({r.comment || 'no comment'})</li>)}</ul>
-      <ul>{myDisputes.map(d=><li key={d.id}>{d.category} · {d.status} · priority {d.priority} — {d.description || ''}</li>)}</ul>
+      <ul>{myDisputes.map(d=><li key={d.id}>{d.category} · {d.status} · priority {d.priority} — {d.description || ''} — <a href="#" onClick={(e) => { e.preventDefault(); viewDispute(d.id) }}>detail</a></li>)}</ul>
+      {disputeDetail && <div>
+        <h3>Dispute {disputeDetail.status} — {disputeDetail.category}</h3>
+        <p className="muted">{disputeDetail.description || 'no description'} · opened {String(disputeDetail.created_at).slice(0,10)}</p>
+        {disputeDetail.resolution && <p><b>Resolution:</b> {disputeDetail.resolution}</p>}
+        {(disputeDetail.linked_refunds || []).length > 0 && (
+          <ul>{(disputeDetail.linked_refunds as any[]).map(r => <li key={r.refund_id}>{refundLabel(r.status)}{r.approved_amount ? ` (${r.approved_amount} ${r.currency})` : ''}</li>)}</ul>
+        )}
+      </div>}
     </section>
     <section className="card"><h2>Activity</h2>{log.map((l,i)=><p key={i}>{l}</p>)}</section>
   </>

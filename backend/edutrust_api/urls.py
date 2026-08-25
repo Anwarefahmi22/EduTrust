@@ -60,6 +60,10 @@ urlpatterns = [
     path("admin/teachers/<uuid:teacher_id>/verify", views.admin_teacher_verify),
     path("admin/teachers/<uuid:teacher_id>/reject", views.admin_teacher_reject),
 
+    # Vertical Slice 9: dispute resolution (CORE)
+    path("admin/disputes", views.admin_disputes),
+    path("admin/disputes/<uuid:dispute_id>/resolve", views.admin_disputes_resolve),
+
     # Vertical Slice 8: refund operations (DEV mock)
     path("payments/<uuid:payment_id>/refund", views.payments_refund),
     path("admin/refunds", views.admin_refunds),

@@ -2795,3 +2795,247 @@ def get_admin_refund(user_id: str, roles: list[str], refund_id: str, request_id:
     )
     detail["provider_event_summary"] = _serialize_row_rows(events)
     return detail
+
+
+# ---- Vertical Slice 9: dispute resolution (CORE — RESOLVED path, nine actions) ----
+#
+# Baselines: State Machines v1.0 section 11 (transitions/actions/effects/forbidden/audit),
+# API Architecture section 19.4 (resolve contract) and section 21.3 (admin list),
+# State Machines v1.1 Addendum section 4.1 (overlay — booking/session never DISPUTED),
+# PRD section 17 (dispute flow v0), VS9 Implementation Plan v1.0 decisions:
+#   P1: two-step refund — resolve creates the REQUESTED refund (dispute-linked); the
+#       operator completes it through the existing VS8 approve endpoint with allocation.
+#       No allocation field is accepted on the resolve request (contract-pure).
+#   P2: REPORT_CORRECTION_REQUIRED is record-only (correction workflow = R14, out of scope).
+#   P3: GET /admin/disputes is a dedicated route (SUPPORT/OPS/ADMIN per API 21.3); reads audited.
+#   P4: OPS may resolve non-SAFETY refund actions; ADMIN required for SAFETY disputes and
+#       for FULL_REFUND after a COMPLETED session (SM section 18.2 ADMIN-override class).
+#   P5: REJECTED / CANCELLED outcomes and the UNDER_REVIEW assignment mechanism are DEFERRED
+#       (contract gaps — not implemented in VS9).
+# Excluded: account actions (R10 — spec UNKNOWN), suspension effects, real provider, production UI.
+# Lock order (acyclic, refined per plan section 19 — session locked before payment so the
+# no-show path never inverts VS5 payout's session-first order):
+#   dispute -> session (no-show actions) -> payment -> booking (inside VS8 create_refund)
+
+DISPUTE_RESOLVE_ACTIONS = {
+    "NO_ACTION", "WARNING", "FULL_REFUND", "PARTIAL_REFUND",
+    "PAYOUT_BLOCKED", "PAYOUT_RELEASED",
+    "TEACHER_NO_SHOW_CONFIRMED", "STUDENT_NO_SHOW_CONFIRMED",
+    "REPORT_CORRECTION_REQUIRED",
+}
+DISPUTE_REFUND_ACTIONS = {"FULL_REFUND", "PARTIAL_REFUND"}
+DISPUTE_NOSHOW_ACTIONS = {
+    "TEACHER_NO_SHOW_CONFIRMED": "TEACHER",
+    "STUDENT_NO_SHOW_CONFIRMED": "STUDENT",
+}
+DISPUTE_RESOLVABLE_STATUSES = ("OPEN", "UNDER_REVIEW")
+
+
+def _dispute_resolve_row_for_update(dispute_id: str) -> dict:
+    row = fetchone(
+        """
+        SELECT d.id::text, d.booking_id::text, d.session_id::text, d.payment_id::text,
+               d.opened_by_user_id::text, d.category::text, d.status::text, d.priority,
+               d.description, d.assigned_admin_user_id::text, d.resolution, d.resolved_at,
+               d.created_at, d.updated_at
+        FROM edutrust.disputes d WHERE d.id=%s FOR UPDATE
+        """,
+        [dispute_id],
+    )
+    if not row:
+        raise ApiError("RESOURCE_NOT_FOUND", "Dispute not found.", 404)
+    return row
+
+
+def _linked_payment_for_dispute(dispute: dict) -> dict:
+    """Identify the payment a dispute refund must target. The dispute always carries a
+    derived booking_id (VS4 open_dispute). The refundable-payment state check itself is
+    left to the VS8 create_refund service (do not bypass VS8 validation)."""
+    if dispute["payment_id"]:
+        payment = fetchone(
+            "SELECT id::text, booking_id::text, amount::text, status::text FROM edutrust.payments WHERE id=%s",
+            [dispute["payment_id"]],
+        )
+    else:
+        payment = fetchone(
+            "SELECT id::text, booking_id::text, amount::text, status::text FROM edutrust.payments "
+            "WHERE booking_id=%s ORDER BY created_at DESC LIMIT 1",
+            [dispute["booking_id"]],
+        )
+    if not payment:
+        raise ApiError("REFUND_INVALID_STATE", "No payment found for this dispute.", 409, {"detail": "no payment on dispute or booking"})
+    return payment
+
+
+def _dispute_detail_payload(dispute_id: str) -> dict:
+    """Response payload for a resolved dispute (VS4/VS8 read shape: access row + party
+    names + linked_refunds). No read-audit event here — the resolving operation is
+    itself audited (DISPUTE_RESOLVED + ADMIN_ACTION)."""
+    row = _dispute_access_row(dispute_id)
+    teacher = fetchone("SELECT public_name FROM edutrust.teacher_profiles WHERE id=(SELECT teacher_id FROM edutrust.bookings WHERE id=%s)", [row["booking_id"]])
+    student = fetchone("SELECT display_name FROM edutrust.student_profiles WHERE id=(SELECT student_id FROM edutrust.bookings WHERE id=%s)", [row["booking_id"]])
+    row["teacher_public_name"] = teacher["public_name"] if teacher else None
+    row["student_display_name"] = student["display_name"] if student else None
+    linked = fetchall(
+        "SELECT id::text AS refund_id, status::text, approved_amount::text, currency FROM edutrust.refunds WHERE dispute_id=%s ORDER BY created_at",
+        [dispute_id],
+    )
+    if linked:
+        row["linked_refunds"] = _serialize_row_rows(linked)
+    return _serialize_row(row)
+
+
+def resolve_dispute(user_id: str, roles: list[str], dispute_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> dict:
+    import json
+    # The URL converter passes dispute_id as a uuid.UUID; the service normalizes to str
+    # once, before the plain-json idempotency canonical (VS8 convention: create_refund /
+    # approve_refund stringify their id in the canonical). Every downstream use (row lock,
+    # nested create_refund data, path f-string, idempotency resource_id) then sees a str.
+    dispute_id = str(dispute_id)
+    actor_role = "ADMIN" if "ADMIN" in roles else "OPS"
+    resolution = str(data.get("resolution") or "").strip()
+    action = str(data.get("action") or "").upper()
+    refund_amount_raw = data.get("refund_amount")
+    account_action = data.get("account_action")
+    if action not in DISPUTE_RESOLVE_ACTIONS:
+        raise ApiError("VALIDATION_ERROR", f"action must be one of {sorted(DISPUTE_RESOLVE_ACTIONS)}.", 400, {"actions": sorted(DISPUTE_RESOLVE_ACTIONS)})
+    if len(resolution) < 3:
+        raise ApiError("VALIDATION_ERROR", "resolution must be at least 3 characters.", 400)
+    # Account actions are excluded from VS9 (R10 spec UNKNOWN) — never interpreted.
+    if account_action is not None:
+        raise ApiError("VALIDATION_ERROR", "account_action is not supported in this slice (account actions are deferred).", 400)
+    refund_amount = None
+    if action in DISPUTE_REFUND_ACTIONS:
+        refund_amount = _refund_amount(refund_amount_raw, "refund_amount")
+    elif refund_amount_raw is not None:
+        raise ApiError("VALIDATION_ERROR", "refund_amount is only valid for FULL_REFUND and PARTIAL_REFUND actions.", 400)
+    _refund_require_key(idempotency_key)
+    canonical = {
+        "dispute_id": str(dispute_id),
+        "resolution": resolution,
+        "action": action,
+        "refund_amount": str(refund_amount) if refund_amount is not None else None,
+        "account_action": None,
+    }
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    with tx():
+        replay = _idempotency_begin("dispute_resolve", user_id, idempotency_key, request_hash, f"/api/v1/admin/disputes/{dispute_id}/resolve")
+        if replay:
+            return replay["response_body"]
+        dispute = _dispute_resolve_row_for_update(dispute_id)
+        if dispute["status"] not in DISPUTE_RESOLVABLE_STATUSES:
+            raise ApiError("DISPUTE_INVALID_STATE", f"Dispute must be OPEN or UNDER_REVIEW to resolve (current: {dispute['status']}).", 409, {"dispute_status": dispute["status"]})
+        # P4: SAFETY disputes require ADMIN (API 19.4).
+        if dispute["category"] == "SAFETY" and "ADMIN" not in roles:
+            raise ApiError("FORBIDDEN", "SAFETY disputes require ADMIN authority to resolve.", 403)
+        # Session lock BEFORE payment (lock-order refinement, plan section 19).
+        session_row = None
+        if dispute["session_id"]:
+            if action in DISPUTE_NOSHOW_ACTIONS:
+                session_row = fetchone("SELECT id::text, status::text FROM edutrust.sessions WHERE id=%s FOR UPDATE", [dispute["session_id"]])
+            else:
+                session_row = fetchone("SELECT id::text, status::text FROM edutrust.sessions WHERE id=%s", [dispute["session_id"]])
+            if not session_row:
+                raise ApiError("RESOURCE_NOT_FOUND", "Dispute session not found.", 404)
+        # P4 (SM 18.2): FULL_REFUND after a COMPLETED session is ADMIN-override class.
+        if action == "FULL_REFUND" and session_row is not None and session_row["status"] == "COMPLETED" and "ADMIN" not in roles:
+            raise ApiError("FORBIDDEN", "Full refund after a completed session requires ADMIN authority.", 403)
+        # No-show confirmations: reuse the existing VS3 no-show path only when the
+        # session is SCHEDULED (plan section 9); otherwise record-only.
+        if action in DISPUTE_NOSHOW_ACTIONS and session_row is not None and session_row["status"] == "SCHEDULED":
+            record_session_no_show(user_id, roles, dispute["session_id"], DISPUTE_NOSHOW_ACTIONS[action], request_id=request_id)
+        refund_id = None
+        refund_detail = None
+        if action in DISPUTE_REFUND_ACTIONS:
+            payment = _linked_payment_for_dispute(dispute)
+            if action == "FULL_REFUND" and refund_amount != Decimal(payment["amount"]):
+                raise ApiError("VALIDATION_ERROR", "FULL_REFUND refund_amount must equal the payment amount.", 400, {"payment_amount": payment["amount"], "refund_amount": str(refund_amount)})
+            if action == "PARTIAL_REFUND" and refund_amount >= Decimal(payment["amount"]):
+                raise ApiError("VALIDATION_ERROR", "PARTIAL_REFUND refund_amount must be less than the payment amount.", 400, {"payment_amount": payment["amount"], "refund_amount": str(refund_amount)})
+            # P1 two-step: the VS8 create is nested (savepoint). Any VS8 error
+            # (state/over-refund/booking mismatch) rolls back the whole resolution —
+            # no half-resolved dispute, no duplicate refund. The deterministic derived
+            # key is defense-in-depth against a second refund row for this dispute.
+            refund_resp = create_refund(
+                user_id, roles, payment["id"],
+                {"amount": str(refund_amount), "currency": "DZD", "reason": resolution, "dispute_id": dispute_id},
+                idempotency_key=f"dispute-resolve-{dispute_id}",
+                request_id=request_id,
+            )
+            refund_id = refund_resp["refund"]["refund_id"]
+            refund_detail = refund_resp["refund"]
+        execute(
+            "UPDATE edutrust.disputes SET status='RESOLVED', resolution=%s, resolved_at=now(), assigned_admin_user_id=%s, updated_at=now() WHERE id=%s",
+            [resolution, user_id, dispute_id],
+        )
+        write_event("DISPUTE_RESOLVED", "dispute", dispute_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"action": action, "refund_id": refund_id, "account_action": None})
+        write_event("ADMIN_ACTION", "dispute", dispute_id, actor_user_id=user_id, actor_role=actor_role,
+                    request_id=request_id, metadata={"action": f"DISPUTE_RESOLVED:{action}", "dispute_id": dispute_id, "refund_id": refund_id, "request_id": request_id})
+        response = {"dispute": _dispute_detail_payload(dispute_id)}
+        if refund_detail is not None:
+            response["refund"] = refund_detail
+        _idempotency_complete("dispute_resolve", user_id, idempotency_key, 200, response, "dispute", dispute_id)
+    return response
+
+
+def list_admin_disputes(user_id: str, roles: list[str], params: dict, request_id: str | None = None) -> dict:
+    """Admin/OPS/SUPPORT dispute monitoring list (API 21.3; plan P3 — reads audited,
+    matching the VS4 dispute-list audit precedent and the API section 21 admin-operation
+    audit rule). The UX-patch resolution_action filter is NOT supported (no action
+    column in the approved schema — plan P3)."""
+    actor_role = "ADMIN" if "ADMIN" in roles else ("OPS" if "OPS" in roles else "SUPPORT")
+    write_event("ADMIN_ACTION", "disputes", None, actor_user_id=user_id, actor_role=actor_role,
+                request_id=request_id, metadata={"action": "READ_DISPUTE_LIST", "admin_list": True})
+    write_security_event("ADMIN_ACCESS", user_id=user_id, severity=2, metadata={"entity": "disputes", "request_id": request_id})
+    conds: list[str] = []
+    sql_params: list = []
+    for field, column, is_int in (("status", "d.status::text", False), ("category", "d.category::text", False), ("priority", "d.priority", True)):
+        value = str(params.get(field) or "").strip()
+        if value:
+            if is_int:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    raise ApiError("VALIDATION_ERROR", "priority filter must be an integer between 1 and 5.", 400)
+            conds.append(f"{column}=%s")
+            sql_params.append(value)
+    frm = str(params.get("from") or "").strip()
+    to = str(params.get("to") or "").strip()
+    if frm:
+        conds.append("d.created_at >= %s")
+        sql_params.append(frm)
+    if to:
+        conds.append("d.created_at <= %s")
+        sql_params.append(to)
+    try:
+        limit = max(1, min(int(params.get("limit") or 20), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    cursor = str(params.get("cursor") or "").strip()
+    if cursor:
+        conds.append("d.created_at < (SELECT created_at FROM edutrust.disputes WHERE id=%s)")
+        sql_params.append(cursor)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    rows = fetchall(
+        f"""
+        SELECT d.id::text, d.booking_id::text, d.session_id::text, d.payment_id::text, d.opened_by_user_id::text,
+               d.category::text, d.status::text, d.priority, d.description, d.assigned_admin_user_id::text,
+               d.resolution, d.resolved_at, d.created_at,
+               tp.public_name AS teacher_public_name, sp.display_name AS student_display_name
+        FROM edutrust.disputes d
+        JOIN edutrust.bookings b ON b.id=d.booking_id
+        JOIN edutrust.teacher_profiles tp ON tp.id=b.teacher_id
+        JOIN edutrust.student_profiles sp ON sp.id=b.student_id
+        {where}
+        ORDER BY d.created_at DESC
+        LIMIT {limit + 1}
+        """,
+        sql_params,
+    )
+    has_more = len(rows) > limit
+    items = _serialize_row_rows(rows[:limit])
+    return {
+        "data": items,
+        "pagination": {"limit": limit, "next_cursor": items[-1]["id"] if has_more else None, "has_more": has_more},
+    }

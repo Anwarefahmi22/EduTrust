@@ -12,6 +12,7 @@ export default function TeacherDashboardShell() {
   const [log, setLog] = useState<string[]>([])
   const [myReviews, setMyReviews] = useState<any[]>([])
   const [myDisputes, setMyDisputes] = useState<any[]>([])
+  const [disputeDetail, setDisputeDetail] = useState<any | null>(null)
   const [myPayouts, setMyPayouts] = useState<any[]>([])
   const [payoutDetail, setPayoutDetail] = useState<any | null>(null)
   const [verifType, setVerifType] = useState('IDENTITY')
@@ -41,6 +42,12 @@ export default function TeacherDashboardShell() {
     const res: any = await apiGet('/api/v1/disputes', token)
     setMyDisputes(res.data || [])
     addLog(`Disputes involving me: ${res.data.length}`)
+  }
+  async function viewDispute(id: string) {
+    try {
+      const res: any = await apiGet(`/api/v1/disputes/${id}`, token)
+      setDisputeDetail(res.data)
+    } catch (e: any) { addLog(`Dispute detail rejected: ${e.message}`) }
   }
 
   async function loadMyPayouts() {
@@ -84,7 +91,12 @@ export default function TeacherDashboardShell() {
       <button className="primary" onClick={loadMyReviews} disabled={!token}>Load my reviews</button>
       <button onClick={loadMyDisputes} disabled={!token}>Load disputes involving me</button>
       <ul>{myReviews.map(r=><li key={r.id}>{r.rating}★ — {r.student_display_name || 'student'}: {r.comment || 'no comment'} (verified={r.is_verified}, {r.status})</li>)}</ul>
-      <ul>{myDisputes.map(d=><li key={d.id}>{d.category} · {d.status} · priority {d.priority} — {d.description || ''}</li>)}</ul>
+      <ul>{myDisputes.map(d=><li key={d.id}>{d.category} · {d.status} · priority {d.priority} — {d.description || ''} — <a href="#" onClick={(e) => { e.preventDefault(); viewDispute(d.id) }}>detail</a></li>)}</ul>
+      {disputeDetail && <div>
+        <h3>Dispute {disputeDetail.status} — {disputeDetail.category}</h3>
+        <p className="muted">{disputeDetail.description || 'no description'}</p>
+        {disputeDetail.resolution && <p><b>Resolution:</b> {disputeDetail.resolution}</p>}
+      </div>}
     </section>
     <section className="card"><span className="badge success">VS5 — Payouts</span><h2>My Payouts</h2>
       <button className="primary" onClick={loadMyPayouts} disabled={!token}>Load my payouts</button>

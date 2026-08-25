@@ -31,6 +31,13 @@ export default function AdminDashboardShell() {
   const [rReconcileResult, setRReconcileResult] = useState('SUCCEEDED')
   const [rReconcileRef, setRReconcileRef] = useState('')
   const [refundResult, setRefundResult] = useState('')
+  const [adminDisputes, setAdminDisputes] = useState<any[]>([])
+  const [dStatusFilter, setDStatusFilter] = useState('')
+  const [dResolution, setDResolution] = useState('')
+  const [dAction, setDAction] = useState('')
+  const [dRefundAmount, setDRefundAmount] = useState('')
+  const [dResolveTarget, setDResolveTarget] = useState('')
+  const [dResolveResult, setDResolveResult] = useState('')
   const addLog = (m: string) => setLog((l) => [m, ...l].slice(0, 12))
   async function loginOnly() { const res:any=await apiPost('/api/v1/auth/login',{identifier:email,password}); setToken(res.data.access_token); addLog('Admin logged in') }
   async function securityEvents() { const res:any=await apiGet('/api/v1/admin/security-events',token); addLog(`Security events ${res.data.count}`) }
@@ -145,6 +152,32 @@ export default function AdminDashboardShell() {
     } catch (e: any) { setRefundResult(`${action} rejected: ${e.message}`); addLog(`Refund ${action} rejected: ${e.message}`) }
   }
 
+  const DISPUTE_ACTIONS = ['NO_ACTION', 'WARNING', 'FULL_REFUND', 'PARTIAL_REFUND', 'PAYOUT_BLOCKED', 'PAYOUT_RELEASED', 'TEACHER_NO_SHOW_CONFIRMED', 'STUDENT_NO_SHOW_CONFIRMED', 'REPORT_CORRECTION_REQUIRED']
+  async function loadAdminDisputes() {
+    const qs = dStatusFilter ? `?status=${encodeURIComponent(dStatusFilter)}` : ''
+    const res: any = await apiGet(`/api/v1/admin/disputes${qs}`, token)
+    setAdminDisputes(res.data || [])
+    addLog(`Admin disputes ${res.data.length} — access audited`)
+  }
+  async function resolveDispute() {
+    const target = dResolveTarget || (adminDisputes.find((d: any) => d.status === 'OPEN' || d.status === 'UNDER_REVIEW') || {}).id
+    if (!target) { setDResolveResult('Select an OPEN/UNDER_REVIEW dispute to resolve'); return }
+    if (!dResolution.trim()) { setDResolveResult('Enter a resolution (required, min 3 chars)'); return }
+    if (!dAction) { setDResolveResult('Select a resolution action'); return }
+    const body: any = { resolution: dResolution.trim(), action: dAction }
+    if (dAction === 'FULL_REFUND' || dAction === 'PARTIAL_REFUND') {
+      if (!dRefundAmount.trim()) { setDResolveResult('Enter the refund_amount for refund actions'); return }
+      body.refund_amount = dRefundAmount.trim()
+    }
+    try {
+      const res: any = await apiPost(`/api/v1/admin/disputes/${target}/resolve`, body, token, `dispute-${crypto.randomUUID()}`)
+      const r = res.data.refund
+      setDResolveResult(`Resolved (${dAction}) → RESOLVED${r ? ` · refund ${r.refund_id} ${r.status} — next: approve it with allocation in the Refunds section (two-step, P1)` : ''}`)
+      addLog(`Dispute ${target} resolved: ${dAction}${r ? ` → refund ${r.refund_id}` : ''}`)
+      loadAdminDisputes()
+    } catch (e: any) { setDResolveResult(`Resolve rejected: ${e.message}`); addLog(`Dispute resolve rejected: ${e.message}`) }
+  }
+
   return <>
     <section className="card"><span className="badge warning">Admin / OPS shell</span><h1>Admin Dashboard</h1><p className="muted">Admin users are seeded/created outside public registration. Sensitive access is logged.</p></section>
     <section className="grid"><div className="card"><h2>Login</h2><input value={email} onChange={e=>setEmail(e.target.value)} style={{width:'100%',padding:8}}/><br/><br/><button className="primary" onClick={loginOnly}>Login existing admin</button></div><div className="card"><h2>Audit</h2><button className="primary" onClick={securityEvents} disabled={!token}>Read security events</button> <button onClick={payments} disabled={!token}>Payments</button> <button onClick={events} disabled={!token}>Event ledger</button> <button onClick={sessions} disabled={!token}>Sessions</button><p className="muted">This access will be logged.</p></div></section>
@@ -248,6 +281,30 @@ export default function AdminDashboardShell() {
         {refundResult && <p className="muted">{refundResult}</p>}
       </div>}
       <p className="muted">DEV mock only: no real refund provider, no real money. Allocation is actor-supplied (no automatic formula). All actions are audited (ADMIN_ACTION + security events); REFUND_ISSUED is never emitted.</p>
+    </section>
+    <section className="card"><span className="badge warning">VS9 — Dispute Resolution (CORE)</span><h2>Disputes (operational)</h2>
+      <select value={dStatusFilter} onChange={e=>setDStatusFilter(e.target.value)} style={{padding:4}}>
+        <option value="">all statuses</option>
+        {['OPEN', 'UNDER_REVIEW', 'RESOLVED', 'REJECTED', 'CANCELLED'].map(s=><option key={s} value={s}>{s}</option>)}
+      </select>
+      <button className="primary" onClick={loadAdminDisputes} disabled={!token}>Load admin disputes</button>
+      <ul>{adminDisputes.map(d => (
+        <li key={d.id}>{d.category} · <b>{d.status}</b> · p{d.priority} — {d.teacher_public_name || ''} / {d.student_display_name || ''} — {(d.description || '').slice(0, 80)}
+          {(d.status === 'OPEN' || d.status === 'UNDER_REVIEW') && <label style={{marginLeft:8}}><input type="radio" name="dresolve" checked={dResolveTarget === d.id} onChange={() => setDResolveTarget(d.id)}/> resolve</label>}
+          {d.resolution ? <div className="muted">resolution ({d.assigned_admin_user_id ? 'audited' : ''}): {d.resolution}{(d.linked_refunds || []).map((r: any) => ` · refund ${r.refund_id} ${r.status}`)}</div> : null}
+        </li>
+      ))}</ul>
+      <h3>Resolve (RESOLVED path — CORE)</h3>
+      <input placeholder="resolution text (required)" value={dResolution} onChange={e=>setDResolution(e.target.value)} style={{width:'100%',padding:8}}/>
+      <select value={dAction} onChange={e=>setDAction(e.target.value)} style={{padding:8}}>
+        <option value="">action…</option>
+        {DISPUTE_ACTIONS.map(a=><option key={a} value={a}>{a}</option>)}
+      </select>
+      {(dAction === 'FULL_REFUND' || dAction === 'PARTIAL_REFUND') && <input placeholder="refund_amount (FULL = payment amount; PARTIAL < payment amount)" value={dRefundAmount} onChange={e=>setDRefundAmount(e.target.value)} style={{width:320,padding:8}}/>}
+      <br/><br/>
+      <button onClick={resolveDispute} disabled={!token}>Resolve dispute</button>
+      {dResolveResult && <p className="muted">{dResolveResult}</p>}
+      <p className="muted">OPS/ADMIN only (SAFETY disputes and full refund after a completed session require ADMIN). Refund actions are two-step: this creates the refund REQUESTED; approval with allocation happens in the Refunds section above. REJECTED/CANCELLED outcomes and account actions are not part of VS9 (deferred). All actions audited (ADMIN_ACTION + DISPUTE_RESOLVED); list reads audited.</p>
     </section>
     <section className="card"><h2>Activity</h2>{log.map((l,i)=><p key={i}>{l}</p>)}</section>
   </>

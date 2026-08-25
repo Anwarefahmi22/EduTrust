@@ -404,3 +404,44 @@ Real payout: forbidden
 Production: forbidden
 ```
 
+## DEV Vertical Slice #9
+
+Implemented dispute resolution (CORE: the RESOLVED path, nine actions) on the existing approved baseline (no schema, state-machine, or architecture changes):
+
+```text
+Dispute OPEN / UNDER_REVIEW
+→ resolve (OPS/ADMIN; SAFETY + full-refund-after-completed-session ⇒ ADMIN)
+   NO_ACTION · WARNING · FULL_REFUND · PARTIAL_REFUND · PAYOUT_BLOCKED · PAYOUT_RELEASED
+   TEACHER_NO_SHOW_CONFIRMED · STUDENT_NO_SHOW_CONFIRMED · REPORT_CORRECTION_REQUIRED
+→ RESOLVED (resolution + resolved_at + resolver — SM §11.7; DISPUTE_RESOLVED + ADMIN_ACTION)
+Refund actions are TWO-STEP (plan P1): resolve creates the linked REQUESTED refund via the
+VS8 service; the operator approves it with allocation in the Refunds section (VS8 endpoint).
+REJECTED / CANCELLED / UNDER_REVIEW mechanisms and account actions: deferred (contract gaps / R10 UNKNOWN).
+```
+
+- No ledger mechanism added — every financial effect flows through the VS8 refund forms (L/D/A); post-paid refunds settle via Form A with the old PAID payout byte-identical (v1.4).
+- Open disputes block payout items via the existing v1/VS5 guards; resolution unblocks. No payout code modified.
+- No-show confirmations reuse the VS3 session no-show path, only while the session is SCHEDULED (otherwise record-only).
+- Idempotency + audit events per the existing conventions; reads audited (`ADMIN_ACCESS` + `ADMIN_ACTION`); `REFUND_ISSUED` never emitted.
+
+VS9 endpoints:
+
+```text
+POST /api/v1/admin/disputes/:id/resolve   # OPS/ADMIN, Idempotency-Key required
+GET  /api/v1/admin/disputes               # SUPPORT/OPS/ADMIN (filters + cursor pagination, audited)
+```
+
+Current automated backend tests:
+
+```bash
+./scripts/run_backend_tests.sh
+# 197 passed (160 baseline regression + 37 VS9: 33 service + 4 concurrency)
+```
+
+VS9 E2E (standalone, isolated runtime incl. Next.js production server):
+
+```bash
+PG_BIN=<pg bin dir> python tests/e2e_dispute_resolution.py
+# 75/75 checks PASS (15 scenarios + 11 DB-level financial-integrity gates)
+```
+

@@ -453,3 +453,20 @@ def admin_refund_reconcile(request, refund_id: str):
     from .services import reconcile_refund
     data = reconcile_refund(request.user.id, request.user.roles, refund_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
     return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+# ---- Vertical Slice 9 views: dispute resolution (CORE) ----
+
+@api_view(["POST"])
+@require_roles("OPS", "ADMIN")
+def admin_disputes_resolve(request, dispute_id: str):
+    from .services import resolve_dispute
+    data = resolve_dispute(request.user.id, request.user.roles, dispute_id, request.data or {}, request.headers.get("Idempotency-Key"), request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["GET"])
+@require_roles("SUPPORT", "OPS", "ADMIN")
+def admin_disputes(request):
+    from .services import list_admin_disputes
+    result = list_admin_disputes(request.user.id, request.user.roles, request.query_params, request_id=getattr(request, "request_id", None))
+    return Response({"data": result["data"], "pagination": result["pagination"], "request_id": getattr(request, "request_id", None)})
