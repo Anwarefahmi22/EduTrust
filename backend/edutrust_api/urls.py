@@ -12,6 +12,11 @@ urlpatterns = [
     # the unchanged VS1 service functions; GET list / PATCH / DELETE additive (authorization D1/D2/D6).
     path("students", views.students_collection),
     path("students/<uuid:student_id>", views.students_item),
+    # R7 (VS10 candidate 2, Executor B): Student Passport + Student Permissions (authorization
+    # D3/D4/D5/D7/D9). Distinct URL block; Executor A routes and behavior untouched.
+    path("students/<uuid:student_id>/passport", views.students_passport),
+    path("students/<uuid:student_id>/permissions", views.students_permissions),
+    path("students/<uuid:student_id>/permissions/<uuid:permission_id>", views.students_permission_item),
     path("teachers/me", views.teachers_me),
     path("teachers/subjects", views.teacher_subjects),
     path("teachers/availability/slots", views.teacher_availability_slots),

@@ -524,3 +524,37 @@ def students_item(request, student_id: str):
     else:
         data = get_student(request.user.id, student_id)
     return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+# ============================================================
+# R7 (VS10 candidate 2) — Executor B: Student Passport + Student Permissions
+# (authorization D3/D4/D5/D7/D9). Additive only — Executor A management views,
+# routes, and behavior untouched above.
+# ============================================================
+
+
+@api_view(["GET"])
+@require_roles("PARENT")
+def students_passport(request, student_id: str):
+    from .services import get_student_passport
+    data = get_student_passport(request.user.id, student_id, request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+
+
+@api_view(["POST"])
+@require_roles("PARENT")
+def students_permissions(request, student_id: str):
+    from .services import grant_student_permission
+    payload, status = grant_student_permission(
+        request.user.id, student_id, request.data or {}, request.headers.get("Idempotency-Key"),
+        request_id=getattr(request, "request_id", None),
+    )
+    return Response({"data": payload, "request_id": getattr(request, "request_id", None)}, status=status)
+
+
+@api_view(["DELETE"])
+@require_roles("PARENT")
+def students_permission_item(request, student_id: str, permission_id: str):
+    from .services import revoke_student_permission
+    data = revoke_student_permission(request.user.id, student_id, permission_id, request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})

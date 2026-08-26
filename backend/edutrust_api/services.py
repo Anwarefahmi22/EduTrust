@@ -3342,3 +3342,331 @@ def archive_student(parent_user_id: str, student_id: str, request_id: str | None
             )
             write_event("STUDENT_PROFILE_UPDATED", "student", student_id, actor_user_id=parent_user_id, actor_role="PARENT", request_id=request_id)
     return _student_object_row(student_id)
+
+
+# ============================================================
+# R7 (VS10 candidate 2) — Executor B: Student Passport + Student Permissions
+# Contract: EduTrust_VS10_R7_Implementation_Authorization_v1.0.md
+#   (locks D3 passport aggregation, D4 grant, D5 revoke, D7 booking triple, D9 events;
+#    idempotency per §10; lock order per §11; API §7.2 uniform no-oracle 403).
+# Additive only — no existing function modified; no schema change; no financial surface.
+# ============================================================
+
+
+def _permission_row(permission_id: str) -> dict:
+    return fetchone(
+        """
+        SELECT id::text, student_id::text, parent_id::text, teacher_id::text,
+               granted_for_booking_id::text, scope, starts_at, expires_at, revoked_at, created_at
+        FROM edutrust.student_permissions WHERE id = %s
+        """,
+        [permission_id],
+    )
+
+
+def get_student_passport(parent_user_id: str, student_id: str, request_id: str | None = None) -> dict:
+    """B1 — GET /students/:id/passport (authorization D3; API §7.4 exact shape).
+
+    Read-only aggregation over the existing VS3-populated sources only (sessions,
+    session_reports, student_progress_events; subject names from subjects). MVCC read:
+    no locks, no events, no AI-generated claims. Ownership per §7.2: uniform
+    no-oracle 403 STUDENT_ACCESS_DENIED for foreign AND unknown student ids.
+    D3 mapping: completed_sessions = COUNT(sessions.status COMPLETED) per subject;
+    recent_topics = distinct TOPIC_COVERED topics, latest 10 per subject, recency order;
+    recurring_weaknesses = topics with >= 2 WEAKNESS_OBSERVED events per subject;
+    recent_progress_notes = latest 5 PROGRESS_NOTE + PARTICIPATION_NOTE notes per subject;
+    subject_name = subjects.name_en with name_ar fallback.
+    """
+    parent_id = _student_parent_profile_id(parent_user_id)
+    student = fetchone(
+        "SELECT id::text FROM edutrust.student_profiles WHERE id = %s AND parent_id = %s",
+        [student_id, parent_id],
+    )
+    if not student:
+        raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+
+    subjects = fetchall(
+        """
+        SELECT s.id::text, COALESCE(NULLIF(s.name_en, ''), s.name_ar) AS subject_name
+        FROM edutrust.subjects s
+        WHERE s.id IN (
+            SELECT ses.subject_id FROM edutrust.sessions ses
+            WHERE ses.student_id = %s AND ses.status = 'COMPLETED' AND ses.subject_id IS NOT NULL
+            UNION
+            SELECT sr.subject_id FROM edutrust.session_reports sr
+            WHERE sr.student_id = %s AND sr.subject_id IS NOT NULL
+            UNION
+            SELECT spe.subject_id FROM edutrust.student_progress_events spe
+            WHERE spe.student_id = %s AND spe.subject_id IS NOT NULL
+        )
+        ORDER BY subject_name, s.id
+        """,
+        [student_id, student_id, student_id],
+    )
+
+    completed = {
+        r["subject_id"]: r["count"]
+        for r in fetchall(
+            """
+            SELECT subject_id::text, count(*)::int AS count
+            FROM edutrust.sessions
+            WHERE student_id = %s AND status = 'COMPLETED' AND subject_id IS NOT NULL
+            GROUP BY subject_id
+            """,
+            [student_id],
+        )
+    }
+
+    topic_rows = fetchall(
+        """
+        SELECT subject_id::text, topic FROM (
+            SELECT DISTINCT ON (subject_id, topic) subject_id, topic, created_at, id
+            FROM edutrust.student_progress_events
+            WHERE student_id = %s AND event_type = 'TOPIC_COVERED'
+              AND subject_id IS NOT NULL AND topic IS NOT NULL
+            ORDER BY subject_id, topic, created_at DESC, id DESC
+        ) latest
+        ORDER BY subject_id, created_at DESC, id DESC
+        """,
+        [student_id],
+    )
+    recent_topics: dict[str, list[str]] = {}
+    for row in topic_rows:
+        bucket = recent_topics.setdefault(row["subject_id"], [])
+        if len(bucket) < 10:
+            bucket.append(row["topic"])
+
+    weakness_rows = fetchall(
+        """
+        SELECT subject_id::text, topic
+        FROM edutrust.student_progress_events
+        WHERE student_id = %s AND event_type = 'WEAKNESS_OBSERVED'
+          AND subject_id IS NOT NULL AND topic IS NOT NULL
+        GROUP BY subject_id, topic
+        HAVING count(*) >= 2
+        ORDER BY subject_id, topic
+        """,
+        [student_id],
+    )
+    recurring_weaknesses: dict[str, list[str]] = {}
+    for row in weakness_rows:
+        recurring_weaknesses.setdefault(row["subject_id"], []).append(row["topic"])
+
+    note_rows = fetchall(
+        """
+        SELECT subject_id::text, note FROM (
+            SELECT subject_id, note, created_at, id
+            FROM edutrust.student_progress_events
+            WHERE student_id = %s AND event_type IN ('PROGRESS_NOTE', 'PARTICIPATION_NOTE')
+              AND subject_id IS NOT NULL AND note IS NOT NULL
+            ORDER BY subject_id, created_at DESC, id DESC
+        ) recent
+        ORDER BY subject_id, created_at DESC, id DESC
+        """,
+        [student_id],
+    )
+    recent_progress_notes: dict[str, list[str]] = {}
+    for row in note_rows:
+        bucket = recent_progress_notes.setdefault(row["subject_id"], [])
+        if len(bucket) < 5:
+            bucket.append(row["note"])
+
+    return {
+        "student_id": student_id,
+        "subjects": [
+            {
+                "subject_id": s["id"],
+                "subject_name": s["subject_name"],
+                "completed_sessions": completed.get(s["id"], 0),
+                "recent_topics": recent_topics.get(s["id"], []),
+                "recurring_weaknesses": recurring_weaknesses.get(s["id"], []),
+                "recent_progress_notes": recent_progress_notes.get(s["id"], []),
+            }
+            for s in subjects
+        ],
+    }
+
+
+def _grant_uuid_or_400(value, field: str) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        raise ApiError("VALIDATION_ERROR", f"{field} must be a valid UUID.", 400)
+
+
+def grant_student_permission(parent_user_id: str, student_id: str, data: dict, idempotency_key: str | None, request_id: str | None = None) -> tuple[dict, int]:
+    """B2 — POST /students/:id/permissions (authorization D4 + D7; API §7.5).
+
+    Returns (response_body, http_status): 201 on creation; 200 on idempotent replay
+    (§10 replay convention). Idempotency reuses _idempotency_begin/_complete verbatim
+    with scope 'student_permission_grant'; canonical identity = {student_id, teacher_id,
+    scope, granted_for_booking_id, expires_at} (stringified; nulls as null).
+    Concurrency (§11): the owning student row is locked FOR UPDATE inside the idempotency
+    transaction, so the duplicate-active check serializes C-1/C-2 races with no schema
+    change and no unique index. Errors: 403 STUDENT_ACCESS_DENIED uniform (student
+    ownership / foreign-parent booking); 400 VALIDATION_ERROR (unknown teacher, unknown
+    scope, malformed ids, missing booking, booking-student/teacher mismatch, past or
+    unparseable expires_at); 409 DUPLICATE_PERMISSION (active canonical duplicate under a
+    different key, D4); 400/409 idempotency classes per §10. Event per D9:
+    STUDENT_PROFILE_UPDATED (entity student, actor PARENT) on creation only.
+    """
+    import json
+    from datetime import datetime as _dt
+    from datetime import timezone as _dtz
+
+    def _iso(value):
+        # Render timestamps exactly as the API envelope renders them, so an idempotent
+        # replay (§10: stored body) is byte-identical to the original 201 response.
+        return value.isoformat().replace("+00:00", "Z") if value is not None else None
+
+    teacher_raw = data.get("teacher_id")
+    scope = str(data.get("scope") or "")
+    booking_raw = data.get("granted_for_booking_id")
+    expires_raw = data.get("expires_at")
+
+    canonical = {
+        "student_id": str(student_id),
+        "teacher_id": str(teacher_raw) if teacher_raw else None,
+        "scope": scope or None,
+        "granted_for_booking_id": str(booking_raw) if booking_raw else None,
+        "expires_at": str(expires_raw) if expires_raw else None,
+    }
+    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+
+    with tx():
+        if not idempotency_key:
+            # Same precondition and error class as _idempotency_begin (§10), checked before
+            # the student lock so the required-key contract keeps its precedence.
+            raise ApiError("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required.", 400)
+        parent_id = _student_parent_profile_id(parent_user_id)
+        # §11 lock order: the owning student row is locked FIRST, inside the idempotency
+        # transaction — all grants/revokes for one student serialize here, so a concurrent
+        # same-key replay observes the COMPLETED idempotency row (200) instead of racing the
+        # idempotency INSERT (C-1), and concurrent different-key duplicates serialize to one
+        # active row (C-2). student_permissions rows are leaves (no reverse edges — §11).
+        student = fetchone(
+            "SELECT id::text FROM edutrust.student_profiles WHERE id = %s AND parent_id = %s FOR UPDATE",
+            [student_id, parent_id],
+        )
+        if not student:
+            raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+        replay = _idempotency_begin(
+            "student_permission_grant", parent_user_id, idempotency_key, request_hash,
+            f"/api/v1/students/{student_id}/permissions",
+        )
+        if replay:
+            return replay["response_body"], 200
+
+        if not teacher_raw:
+            raise ApiError("VALIDATION_ERROR", "teacher_id and scope are required.", 400)
+        if scope != "SESSION_CONTEXT":
+            raise ApiError("VALIDATION_ERROR", "scope must be SESSION_CONTEXT.", 400)
+        teacher_id = _grant_uuid_or_400(teacher_raw, "teacher_id")
+        teacher = fetchone("SELECT id::text FROM edutrust.teacher_profiles WHERE id = %s", [teacher_id])
+        if not teacher:
+            raise ApiError("VALIDATION_ERROR", "Teacher does not exist.", 400)
+
+        expires_at = None
+        if expires_raw:
+            try:
+                parsed = _dt.fromisoformat(str(expires_raw).replace("Z", "+00:00"))
+            except ValueError:
+                raise ApiError("VALIDATION_ERROR", "expires_at must be an ISO-8601 timestamp.", 400)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_dtz.utc)
+            if parsed <= timezone.now():
+                raise ApiError("VALIDATION_ERROR", "expires_at must be in the future.", 400)
+            expires_at = parsed
+
+        granted_for_booking_id = None
+        if booking_raw:
+            granted_for_booking_id = _grant_uuid_or_400(booking_raw, "granted_for_booking_id")
+            booking = fetchone(
+                "SELECT id::text, parent_id::text, student_id::text, teacher_id::text FROM edutrust.bookings WHERE id = %s",
+                [granted_for_booking_id],
+            )
+            if not booking:
+                raise ApiError("VALIDATION_ERROR", "Booking does not exist.", 400)
+            # D7: booking must belong to the acting parent (foreign parent → uniform 403) and
+            # match student + teacher server-side (mismatch → 400). No client-supplied trust.
+            if booking["parent_id"] != parent_id:
+                raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+            if booking["student_id"] != str(student_id) or booking["teacher_id"] != teacher_id:
+                raise ApiError("VALIDATION_ERROR", "Booking does not match this student and teacher.", 400)
+
+        duplicate = fetchone(
+            """
+            SELECT id::text FROM edutrust.student_permissions
+            WHERE student_id = %s AND teacher_id = %s AND scope = %s
+              AND granted_for_booking_id IS NOT DISTINCT FROM %s
+              AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
+            """,
+            [student_id, teacher_id, scope, granted_for_booking_id],
+        )
+        if duplicate:
+            raise ApiError("DUPLICATE_PERMISSION", "An active permission already exists for this teacher, scope, and booking.", 409)
+
+        permission = fetchone(
+            """
+            INSERT INTO edutrust.student_permissions
+                (student_id, parent_id, teacher_id, granted_for_booking_id, scope, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id::text, student_id::text, parent_id::text, teacher_id::text,
+                      granted_for_booking_id::text, scope, starts_at, expires_at, revoked_at, created_at
+            """,
+            [student_id, parent_id, teacher_id, granted_for_booking_id, scope, expires_at],
+        )
+        write_event(
+            "STUDENT_PROFILE_UPDATED", "student", student_id,
+            actor_user_id=parent_user_id, actor_role="PARENT", request_id=request_id,
+            metadata={"action": "PERMISSION_GRANTED", "permission_id": permission["id"]},
+        )
+        response = {"permission": {k: (_iso(v) if k in ("starts_at", "expires_at", "revoked_at", "created_at") else v)
+                                   for k, v in permission.items()}}
+        _idempotency_complete(
+            "student_permission_grant", parent_user_id, idempotency_key, 201, response,
+            "student_permission", permission["id"],
+        )
+        return response, 201
+
+
+def revoke_student_permission(parent_user_id: str, student_id: str, permission_id: str, request_id: str | None = None) -> dict:
+    """B3 — DELETE /students/:id/permissions/:permission_id (authorization D5).
+
+    Guarded terminal transition (R6 revoke precedent): no Idempotency-Key; a repeated
+    revoke is a 200 no-op with revoked_at unchanged and no second event; foreign,
+    unknown, and wrong-student permissions are uniform 403 STUDENT_ACCESS_DENIED
+    (§7.2 no oracle). The row is never deleted (UPDATE revoked_at only); re-grant
+    creates a new row. §11 lock order: student row first, then the permission row.
+    Event per D9: STUDENT_PROFILE_UPDATED (entity student, actor PARENT) on the first
+    successful transition only.
+    """
+    with tx():
+        parent_id = _student_parent_profile_id(parent_user_id)
+        student = fetchone(
+            "SELECT id::text FROM edutrust.student_profiles WHERE id = %s AND parent_id = %s FOR UPDATE",
+            [student_id, parent_id],
+        )
+        if not student:
+            raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+        permission = fetchone(
+            """
+            SELECT id::text, student_id::text, revoked_at
+            FROM edutrust.student_permissions WHERE id = %s FOR UPDATE
+            """,
+            [permission_id],
+        )
+        if not permission or permission["student_id"] != str(student_id):
+            raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+        if permission["revoked_at"] is not None:
+            return _permission_row(permission_id)  # idempotent no-op — no second event (D5)
+        execute(
+            "UPDATE edutrust.student_permissions SET revoked_at = now() WHERE id = %s AND revoked_at IS NULL",
+            [permission_id],
+        )
+        write_event(
+            "STUDENT_PROFILE_UPDATED", "student", student_id,
+            actor_user_id=parent_user_id, actor_role="PARENT", request_id=request_id,
+            metadata={"action": "PERMISSION_REVOKED", "permission_id": permission_id},
+        )
+        return _permission_row(permission_id)
