@@ -8,8 +8,10 @@ urlpatterns = [
     # DEV Vertical Slice 10: R6 auth completion
     path("auth/refresh", views.refresh_view),
     path("auth/revoke-sessions", views.revoke_sessions_view),
-    path("students", views.students_create),
-    path("students/<uuid:student_id>", views.students_detail),
+    # R7 (VS10 candidate 2, Executor A): combined routes — POST/GET(VS1) behavior preserved via
+    # the unchanged VS1 service functions; GET list / PATCH / DELETE additive (authorization D1/D2/D6).
+    path("students", views.students_collection),
+    path("students/<uuid:student_id>", views.students_item),
     path("teachers/me", views.teachers_me),
     path("teachers/subjects", views.teacher_subjects),
     path("teachers/availability/slots", views.teacher_availability_slots),

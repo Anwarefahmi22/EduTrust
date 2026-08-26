@@ -3150,3 +3150,195 @@ def revoke_sessions(user_id: str, scope: str, current_session_id: str | None, re
                 )
     # D2.2: self-count only — no session identifiers, no token values, no details.
     return {"revoked": revoked}
+
+
+# ---- R7 (VS10 candidate 2) Student Management Completion — Executor A (A1–A3) ----
+# Authorization: EduTrust_VS10_R7_Implementation_Authorization_v1.0.md
+# (locks D1/D1e, D2, D6, D7, D9; Executor A scope: list / patch / archive only).
+#
+# Conventions reused (not duplicated):
+#  - VS1 ownership no-oracle: uniform 403 STUDENT_ACCESS_DENIED for foreign AND unknown ids.
+#  - student-row FOR UPDATE locking — leaf object, acyclic (R7 doc §11).
+#  - STUDENT_PROFILE_UPDATED (pre-existing enum value) only on actual transitions
+#    (R6 guarded-transition convention, D9); no events for the list read (D9).
+# No schema change; no new event values; zero financial surface.
+
+STUDENT_UPDATABLE_FIELDS = (
+    "display_name",
+    "birth_year",
+    "academic_level_id",
+    "school_year",
+    "primary_goal",
+    "preferred_mode",
+    "consent_status",
+)
+TEACHING_MODE_VALUES = ("ONLINE", "IN_PERSON", "HYBRID")
+CONSENT_STATUS_VALUES = ("PENDING", "GRANTED", "REVOKED")
+BIRTH_YEAR_MIN, BIRTH_YEAR_MAX = 1990, 2035  # §7.3 parity; schema CHECK is the backstop
+
+STUDENT_OBJECT_COLUMNS = """id::text, display_name, birth_year::int, academic_level_id::text,
+       school_year, primary_goal, preferred_mode::text, consent_status::text,
+       status::text, parent_id::text, created_at, updated_at"""
+
+
+def _student_parent_profile_id(user_id: str) -> str:
+    """Acting parent's profile id (VS1 convention: 403 FORBIDDEN if the JWT user has no parent profile)."""
+    parent = fetchone("SELECT id::text FROM edutrust.parent_profiles WHERE user_id = %s", [user_id])
+    if not parent:
+        raise ApiError("FORBIDDEN", "Parent profile is required.", 403)
+    return parent["id"]
+
+
+def _student_object_row(student_id: str) -> dict:
+    """Full student object (the PATCH/DELETE response shape per D1 'updated student object')."""
+    row = fetchone(
+        f"SELECT {STUDENT_OBJECT_COLUMNS} FROM edutrust.student_profiles WHERE id = %s",
+        [student_id],
+    )
+    if row is None:
+        raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+    return row
+
+
+def list_students(parent_user_id: str, request_id: str | None = None) -> list[dict]:
+    """A1 — GET /students (D6): own students only; item = get_student field set + created_at;
+    ordered created_at DESC; no pagination; no event (read)."""
+    parent_id = _student_parent_profile_id(parent_user_id)
+    return fetchall(
+        """
+        SELECT id::text, display_name, status::text, parent_id::text, created_at
+        FROM edutrust.student_profiles
+        WHERE parent_id = %s
+        ORDER BY created_at DESC
+        """,
+        [parent_id],
+    )
+
+
+def _validate_student_patch_fields(data: dict) -> dict:
+    """D1/D1e — §7.3 validation parity. Returns {field: value} for provided updatable fields
+    only; server-owned fields (id, parent_id, status, timestamps) and unknown fields are
+    ignored (D1). Explicit null clears a nullable column; NOT NULL fields must be valid."""
+    updates: dict = {}
+    for key, value in (data or {}).items():
+        if key not in STUDENT_UPDATABLE_FIELDS:
+            continue
+        if key == "display_name":
+            text = str(value or "").strip()
+            if not text:
+                raise ApiError("VALIDATION_ERROR", "display_name must be a non-empty string.", 400, {"field": "display_name"})
+            updates["display_name"] = text
+        elif key == "birth_year":
+            if value is None:
+                updates["birth_year"] = None
+            elif isinstance(value, bool) or not isinstance(value, int) or not (BIRTH_YEAR_MIN <= value <= BIRTH_YEAR_MAX):
+                raise ApiError("VALIDATION_ERROR", f"birth_year must be an integer between {BIRTH_YEAR_MIN} and {BIRTH_YEAR_MAX}.", 400, {"field": "birth_year"})
+            else:
+                updates["birth_year"] = value
+        elif key == "academic_level_id":
+            if value is None:
+                updates["academic_level_id"] = None
+            else:
+                try:
+                    level_uuid = str(uuid.UUID(str(value)))
+                except (ValueError, AttributeError, TypeError):
+                    raise ApiError("VALIDATION_ERROR", "academic_level_id must be a UUID.", 400, {"field": "academic_level_id"})
+                level = fetchone("SELECT 1 AS ok FROM edutrust.academic_levels WHERE id = %s AND is_active", [level_uuid])
+                if not level:
+                    raise ApiError("VALIDATION_ERROR", "academic_level_id must reference an active academic level.", 400, {"field": "academic_level_id"})
+                updates["academic_level_id"] = level_uuid
+        elif key in ("school_year", "primary_goal"):
+            if value is None:
+                updates[key] = None
+            elif not isinstance(value, str) or not value.strip():
+                raise ApiError("VALIDATION_ERROR", f"{key} must be a non-empty string.", 400, {"field": key})
+            else:
+                updates[key] = value
+        elif key == "preferred_mode":
+            if value is None:
+                updates["preferred_mode"] = None
+            else:
+                mode = str(value).upper()
+                if mode not in TEACHING_MODE_VALUES:
+                    raise ApiError("VALIDATION_ERROR", "preferred_mode must be ONLINE, IN_PERSON, or HYBRID.", 400, {"field": "preferred_mode"})
+                updates["preferred_mode"] = mode
+        elif key == "consent_status":
+            if value is None:
+                raise ApiError("VALIDATION_ERROR", "consent_status must be PENDING, GRANTED, or REVOKED.", 400, {"field": "consent_status"})
+            status = str(value).upper()
+            if status not in CONSENT_STATUS_VALUES:
+                raise ApiError("VALIDATION_ERROR", "consent_status must be PENDING, GRANTED, or REVOKED.", 400, {"field": "consent_status"})
+            updates["consent_status"] = status
+    return updates
+
+
+def update_student(parent_user_id: str, student_id: str, data: dict, request_id: str | None = None) -> dict:
+    """A2 — PATCH /students/:id (D1): updatable field set per lock D1; server-owned fields are
+    ignored if sent; §7.3 validation parity (D1e); last-writer-wins under the student-row lock
+    (D1d); STUDENT_PROFILE_UPDATED per actual update (D9). No updatable field provided →
+    no-op 200 returning the current row, no event (D1 'ignored if sent' + R6 guarded-transition
+    silence)."""
+    parent_id = _student_parent_profile_id(parent_user_id)
+    updates = _validate_student_patch_fields(data or {})
+    with tx():
+        student = fetchone(
+            """
+            SELECT id::text, display_name, status::text, parent_id::text
+            FROM edutrust.student_profiles
+            WHERE id = %s AND parent_id = %s
+            FOR UPDATE
+            """,
+            [student_id, parent_id],
+        )
+        if not student:
+            raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+        if updates:
+            set_parts, params = [], []
+            for key, value in updates.items():
+                # column → enum-type mapping (preferred_mode column is of type teaching_mode)
+                if key == "preferred_mode":
+                    set_parts.append("preferred_mode = %s::edutrust.teaching_mode")
+                elif key == "consent_status":
+                    set_parts.append("consent_status = %s::edutrust.consent_status")
+                else:
+                    set_parts.append(f"{key} = %s")
+                params.append(value)
+            set_parts.append("updated_at = now()")
+            params.append(student["id"])
+            execute(
+                f"""
+                UPDATE edutrust.student_profiles
+                SET {', '.join(set_parts)}
+                WHERE id = %s
+                """,
+                params,
+            )
+            write_event("STUDENT_PROFILE_UPDATED", "student", student["id"], actor_user_id=parent_user_id, actor_role="PARENT", request_id=request_id)
+    return _student_object_row(student["id"])
+
+
+def archive_student(parent_user_id: str, student_id: str, request_id: str | None = None) -> dict:
+    """A3 — DELETE /students/:id (D2): soft-archive ACTIVE → ARCHIVED; repeated DELETE is an
+    idempotent no-op (200, no second event — R6 guarded-transition convention); the row is
+    always retained (no hard delete — bookings RESTRICT FK + minimized-data retention);
+    STUDENT_PROFILE_UPDATED on the first transition only (D9)."""
+    parent_id = _student_parent_profile_id(parent_user_id)
+    with tx():
+        student = fetchone(
+            """
+            SELECT id::text, status::text
+            FROM edutrust.student_profiles
+            WHERE id = %s AND parent_id = %s
+            FOR UPDATE
+            """,
+            [student_id, parent_id],
+        )
+        if not student:
+            raise ApiError("STUDENT_ACCESS_DENIED", "You do not have access to this student profile.", 403)
+        if student["status"] != "ARCHIVED":
+            execute(
+                "UPDATE edutrust.student_profiles SET status = 'ARCHIVED'::edutrust.student_status, updated_at = now() WHERE id = %s",
+                [student_id],
+            )
+            write_event("STUDENT_PROFILE_UPDATED", "student", student_id, actor_user_id=parent_user_id, actor_role="PARENT", request_id=request_id)
+    return _student_object_row(student_id)

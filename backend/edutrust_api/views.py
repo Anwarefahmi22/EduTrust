@@ -492,3 +492,35 @@ def admin_disputes(request):
     from .services import list_admin_disputes
     result = list_admin_disputes(request.user.id, request.user.roles, request.query_params, request_id=getattr(request, "request_id", None))
     return Response({"data": result["data"], "pagination": result["pagination"], "request_id": getattr(request, "request_id", None)})
+
+
+# ---- R7 (VS10 candidate 2) Student Management Completion — Executor A views (A1–A3) ----
+# Authorization: EduTrust_VS10_R7_Implementation_Authorization_v1.0.md (D1/D2/D6/D9).
+# The collection/item routes are combined views: the VS1 methods (POST create, GET detail)
+# delegate to the SAME unchanged VS1 service functions with identical responses (behavior
+# preservation — regression test T-19); the R7 methods (GET list, PATCH, DELETE) are additive.
+# The pre-existing students_create / students_detail view functions remain in place, untouched.
+
+@api_view(["GET", "POST"])
+@require_roles("PARENT")
+def students_collection(request):
+    if request.method == "GET":
+        from .services import list_students
+        data = list_students(request.user.id, request_id=getattr(request, "request_id", None))
+        return Response({"data": data, "request_id": getattr(request, "request_id", None)})
+    data = create_student(request.user.id, request.data or {}, request_id=getattr(request, "request_id", None))
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)}, status=201)
+
+
+@api_view(["GET", "PATCH", "DELETE"])
+@require_roles("PARENT")
+def students_item(request, student_id: str):
+    if request.method == "PATCH":
+        from .services import update_student
+        data = update_student(request.user.id, student_id, request.data or {}, request_id=getattr(request, "request_id", None))
+    elif request.method == "DELETE":
+        from .services import archive_student
+        data = archive_student(request.user.id, student_id, request_id=getattr(request, "request_id", None))
+    else:
+        data = get_student(request.user.id, student_id)
+    return Response({"data": data, "request_id": getattr(request, "request_id", None)})
